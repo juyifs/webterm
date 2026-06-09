@@ -462,7 +462,7 @@ class WebTerminal {
         // Initialize terminal with saved settings
         this.terminal = new Terminal({
             theme: themes[this.currentTheme],
-            fontFamily: "'Menlo', 'Monaco', 'Consolas', monospace",
+            fontFamily: "'JetBrainsMono Nerd Font Mono', 'Menlo', 'Monaco', 'Consolas', monospace",
             fontSize: this.settings.fontSize,
             lineHeight: 1.2,
             cursorBlink: this.settings.cursorBlink,

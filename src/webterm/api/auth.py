@@ -116,6 +116,11 @@ def get_login_page() -> str:
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WebTerm - Login</title>
     <style>
+        @font-face {
+            font-family: 'JetBrainsMono Nerd Font Mono';
+            src: url('/static/css/JetBrainsMonoNerdFontMono-Regular.ttf') format('truetype');
+        }
+
         :root {
             --ctp-base: #1e1e2e;
             --ctp-mantle: #181825;
@@ -128,7 +133,7 @@ def get_login_page() -> str:
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: 'Menlo', 'Monaco', 'Consolas', monospace;
+            font-family: 'JetBrainsMono Nerd Font Mono', 'Menlo', 'Monaco', 'Consolas', monospace;
             background-color: var(--ctp-base);
             color: var(--ctp-text);
             min-height: 100vh;

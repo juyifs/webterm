@@ -1,5 +1,10 @@
 /* Catppuccin Mocha theme for WebTerm */
 
+@font-face {
+    font-family: "JetBrainsMono Nerd Font Mono";
+    src: url("./JetBrainsMonoNerdFontMono-Regular.ttf") format("truetype");
+}
+
 :root {
     /* Catppuccin Mocha colors */
     --ctp-rosewater: #f5e0dc;
@@ -41,7 +46,7 @@ body {
     height: 100%;
     background-color: var(--ctp-base);
     overflow: hidden;
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-family: 'JetBrainsMono Nerd Font Mono', 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 
 #terminal-container {
@@ -82,7 +87,7 @@ body {
     margin-right: 16px;
     color: var(--ctp-subtext0);
     font-size: 11px;
-    font-family: 'Menlo', 'Monaco', 'Consolas', monospace;
+    font-family: 'JetBrainsMono Nerd Font Mono', 'Menlo', 'Monaco', 'Consolas', monospace;
     background-color: var(--ctp-surface0);
     padding: 4px 10px;
     border-radius: 12px;
@@ -290,7 +295,7 @@ body {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    font-family: 'Menlo', 'Monaco', 'Consolas', monospace;
+    font-family: 'JetBrainsMono Nerd Font Mono', 'Menlo', 'Monaco', 'Consolas', monospace;
 }
 
 .file-list {
@@ -479,7 +484,7 @@ body {
     border: 1px solid var(--ctp-surface0);
     border-radius: 8px;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-    font-family: 'Menlo', 'Monaco', 'Consolas', monospace;
+    font-family: 'JetBrainsMono Nerd Font Mono', 'Menlo', 'Monaco', 'Consolas', monospace;
     font-size: 11px;
     z-index: 1000;
     overflow: hidden;

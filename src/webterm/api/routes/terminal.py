@@ -21,7 +21,7 @@ async def index(request: Request):
     Returns:
         Rendered HTML template
     """
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="index.html", context={})
 
 
 @router.websocket("/ws/terminal")
