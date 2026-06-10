@@ -453,6 +453,11 @@ class WebTerminal {
         this.explorerVisible = false;
         this.currentPath = '~';
         this.pathHistory = [];
+
+        // Clipboard state
+        this.autoCopyEnabled = true;
+        this.lastAutoCopiedSelection = '';
+        this.autoCopyTimer = null;
     }
 
     init() {
@@ -626,19 +631,30 @@ class WebTerminal {
     }
 
     setupClipboard() {
+        // Shared copy helper for manual and auto-copy paths.
+        const copyToClipboard = (text, { showSuccessToast = true } = {}) => {
+            if (!text) return;
+
+            navigator.clipboard.writeText(text)
+                .then(() => {
+                    if (showSuccessToast) {
+                        this.toast.success('Copied to clipboard');
+                    }
+                })
+                .catch((err) => {
+                    console.error('Failed to copy:', err);
+                    this.toast.error('Failed to copy to clipboard');
+                });
+        };
+
         // Custom key event handler for clipboard operations
         this.terminal.attachCustomKeyEventHandler((event) => {
             // Ctrl+Shift+C: Copy
-            if (event.ctrlKey && event.shiftKey && event.key === 'C') {
+            if (event.ctrlKey && event.shiftKey && event.key === 'X') {
                 if (event.type === 'keydown') {
                     const selection = this.terminal.getSelection();
                     if (selection) {
-                        navigator.clipboard.writeText(selection)
-                            .then(() => this.toast.success('Copied to clipboard'))
-                            .catch(err => {
-                                console.error('Failed to copy:', err);
-                                this.toast.error('Failed to copy to clipboard');
-                            });
+                        copyToClipboard(selection);
                     }
                 }
                 return false; // Prevent default
@@ -667,15 +683,33 @@ class WebTerminal {
             const selection = this.terminal.getSelection();
             if (selection) {
                 // If there's a selection, copy it
-                navigator.clipboard.writeText(selection)
-                    .then(() => this.toast.success('Copied to clipboard'))
-                    .catch(err => this.toast.error('Failed to copy'));
+                copyToClipboard(selection);
             } else {
                 // If no selection, paste
                 navigator.clipboard.readText().then(text => {
                     this.send({ type: 'input', data: text });
                 }).catch(err => this.toast.error('Failed to paste'));
             }
+        });
+
+        // Auto-copy when selection changes (e.g. mouse drag selection).
+        this.terminal.onSelectionChange(() => {
+            if (!this.autoCopyEnabled) return;
+
+            const selection = this.terminal.getSelection();
+            if (!selection || selection === this.lastAutoCopiedSelection) return;
+
+            if (this.autoCopyTimer) {
+                clearTimeout(this.autoCopyTimer);
+            }
+
+            this.autoCopyTimer = setTimeout(() => {
+                const currentSelection = this.terminal.getSelection();
+                if (!currentSelection || currentSelection !== selection) return;
+
+                this.lastAutoCopiedSelection = currentSelection;
+                copyToClipboard(currentSelection, { showSuccessToast: true });
+            }, 80);
         });
     }
 
