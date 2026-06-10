@@ -510,7 +510,6 @@ class WebTerminal {
 
         // Set up clipboard support with keyboard shortcuts
         this.setupClipboard();
-        this.setupCursorCompatibility();
 
         // Handle input
         this.terminal.onData((data) => {
@@ -750,32 +749,6 @@ class WebTerminal {
         });
     }
 
-    setupCursorCompatibility() {
-        if (!this.terminal?.parser) {
-            return;
-        }
-
-        // Some TUIs (notably nvim in certain browser terminals) can emit cursor
-        // shape/color control sequences that end up making the cursor invisible.
-        // Keep clipboard OSC52 support, but ignore cursor-specific styling changes.
-        if (this.terminal.parser.registerOscHandler) {
-            this.terminal.parser.registerOscHandler(12, () => true);
-            this.terminal.parser.registerOscHandler(112, () => true);
-        }
-
-        if (this.terminal.parser.registerCsiHandler) {
-            this.terminal.parser.registerCsiHandler({ intermediates: ' ', final: 'q' }, () => true);
-
-            this.terminal.parser.registerCsiHandler({ prefix: '?', final: 'l' }, (params) => {
-                const values = typeof params?.toArray === 'function' ? params.toArray() : [];
-                if (values.length === 1 && values[0] === 25) {
-                    return true;
-                }
-                return false;
-            });
-        }
-    }
-
     setTheme(themeName) {
         if (!themes[themeName]) return;
 
@@ -805,6 +778,23 @@ class WebTerminal {
         }
     }
 
+    getPreferredCursorShapeSequence() {
+        // DECSCUSR mapping:
+        // 1/2 block, 3/4 underline, 5/6 bar (odd blink, even steady)
+        const style = this.settings?.cursorStyle || 'block';
+        const blink = !!this.settings?.cursorBlink;
+
+        if (style === 'underline') {
+            return blink ? '\x1b[3 q' : '\x1b[4 q';
+        }
+
+        if (style === 'bar') {
+            return blink ? '\x1b[5 q' : '\x1b[6 q';
+        }
+
+        return blink ? '\x1b[1 q' : '\x1b[2 q';
+    }
+
     connect() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}/ws/terminal`;
@@ -828,7 +818,11 @@ class WebTerminal {
                 const message = JSON.parse(event.data);
 
                 if (message.type === 'output') {
-                    this.terminal.write(message.data);
+                    // Keep cursor shape controlled by WebTerm settings even if
+                    // nvim/tmux emits its own DECSCUSR cursor-shape sequences.
+                    const preferredShape = this.getPreferredCursorShapeSequence();
+                    const normalized = message.data.replace(/\x1b\[[0-9; ]* q/g, preferredShape);
+                    this.terminal.write(normalized);
                 } else if (message.type === 'error') {
                     console.error('Server error:', message.message);
                     this.toast.error(message.message);
