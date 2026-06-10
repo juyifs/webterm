@@ -153,7 +153,7 @@ You can also use a `.env` file in the working directory.
 
 | Shortcut | Action |
 |----------|--------|
-| `Ctrl+Shift+C` | Copy selection |
+| `Ctrl+Shift+X` | Copy selection |
 | `Ctrl+Shift+V` | Paste from clipboard |
 | Right-click | Context menu (copy/paste) |
 

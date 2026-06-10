@@ -647,9 +647,39 @@ class WebTerminal {
                 });
         };
 
+        // Handle OSC52 clipboard sequences (used by tmux set-clipboard).
+        const registerOsc52Handler = () => {
+            if (!this.terminal?.parser?.registerOscHandler) {
+                return;
+            }
+
+            this.terminal.parser.registerOscHandler(52, (data) => {
+                if (!data) return true;
+
+                const separatorIndex = data.indexOf(';');
+                if (separatorIndex === -1) return true;
+
+                const payload = data.slice(separatorIndex + 1);
+                if (!payload || payload === '?') return true;
+
+                try {
+                    const binary = atob(payload);
+                    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+                    const text = new TextDecoder().decode(bytes);
+                    copyToClipboard(text, { showSuccessToast: true });
+                } catch (err) {
+                    console.error('Failed to handle OSC52 clipboard payload:', err);
+                }
+
+                return true;
+            });
+        };
+
+        registerOsc52Handler();
+
         // Custom key event handler for clipboard operations
         this.terminal.attachCustomKeyEventHandler((event) => {
-            // Ctrl+Shift+C: Copy
+            // Ctrl+Shift+X: Copy (user custom shortcut)
             if (event.ctrlKey && event.shiftKey && event.key === 'X') {
                 if (event.type === 'keydown') {
                     const selection = this.terminal.getSelection();
