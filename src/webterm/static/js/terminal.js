@@ -472,8 +472,9 @@ class WebTerminal {
             lineHeight: 1.2,
             cursorBlink: this.settings.cursorBlink,
             cursorStyle: this.settings.cursorStyle,
+            cursorInactiveStyle: 'block',
             scrollback: 10000,
-            convertEol: true,
+            convertEol: false,
             allowProposedApi: true,
         });
 
@@ -498,12 +499,18 @@ class WebTerminal {
         const container = document.getElementById('terminal');
         this.terminal.open(container);
         this.fitAddon.fit();
+        this.terminal.focus();
+
+        const ensureTerminalFocus = () => this.terminal.focus();
+        container.addEventListener('mousedown', ensureTerminalFocus);
+        container.addEventListener('wheel', ensureTerminalFocus, { passive: true });
 
         // Initialize Command Palette
         this.commandPalette = new CommandPalette(this);
 
         // Set up clipboard support with keyboard shortcuts
         this.setupClipboard();
+        this.setupCursorCompatibility();
 
         // Handle input
         this.terminal.onData((data) => {
@@ -741,6 +748,32 @@ class WebTerminal {
                 copyToClipboard(currentSelection, { showSuccessToast: true });
             }, 80);
         });
+    }
+
+    setupCursorCompatibility() {
+        if (!this.terminal?.parser) {
+            return;
+        }
+
+        // Some TUIs (notably nvim in certain browser terminals) can emit cursor
+        // shape/color control sequences that end up making the cursor invisible.
+        // Keep clipboard OSC52 support, but ignore cursor-specific styling changes.
+        if (this.terminal.parser.registerOscHandler) {
+            this.terminal.parser.registerOscHandler(12, () => true);
+            this.terminal.parser.registerOscHandler(112, () => true);
+        }
+
+        if (this.terminal.parser.registerCsiHandler) {
+            this.terminal.parser.registerCsiHandler({ intermediates: ' ', final: 'q' }, () => true);
+
+            this.terminal.parser.registerCsiHandler({ prefix: '?', final: 'l' }, (params) => {
+                const values = typeof params?.toArray === 'function' ? params.toArray() : [];
+                if (values.length === 1 && values[0] === 25) {
+                    return true;
+                }
+                return false;
+            });
+        }
     }
 
     setTheme(themeName) {
