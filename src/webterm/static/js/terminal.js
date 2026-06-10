@@ -458,6 +458,9 @@ class WebTerminal {
         this.autoCopyEnabled = true;
         this.lastAutoCopiedSelection = '';
         this.autoCopyTimer = null;
+
+        // Buffer trailing partial ANSI sequences between websocket chunks.
+        this.outputSanitizeRemainder = '';
     }
 
     init() {
@@ -770,6 +773,9 @@ class WebTerminal {
         for (const [key, value] of Object.entries(vars)) {
             root.style.setProperty(key, value);
         }
+
+        // Keep cursor styling available to CSS overrides.
+        root.style.setProperty('--wt-cursor', themes[themeName].cursor);
     }
 
     handleResize() {
@@ -778,21 +784,77 @@ class WebTerminal {
         }
     }
 
-    getPreferredCursorShapeSequence() {
-        // DECSCUSR mapping:
-        // 1/2 block, 3/4 underline, 5/6 bar (odd blink, even steady)
-        const style = this.settings?.cursorStyle || 'block';
-        const blink = !!this.settings?.cursorBlink;
-
-        if (style === 'underline') {
-            return blink ? '\x1b[3 q' : '\x1b[4 q';
+    splitOutputRemainder(data) {
+        if (!data) {
+            return { processable: '', remainder: '' };
         }
 
-        if (style === 'bar') {
-            return blink ? '\x1b[5 q' : '\x1b[6 q';
+        const lastEsc = data.lastIndexOf('\x1b');
+        if (lastEsc === -1) {
+            return { processable: data, remainder: '' };
         }
 
-        return blink ? '\x1b[1 q' : '\x1b[2 q';
+        const tail = data.slice(lastEsc);
+        if (!tail.startsWith('\x1b[') && !tail.startsWith('\x1b]') && !tail.startsWith('\x1bPtmux;') && !tail.startsWith('\x1b\x1b[')) {
+            return { processable: data, remainder: '' };
+        }
+
+        const csiComplete = /^\x1b\[[0-9;? ]*[ -/]*[@-~]/.test(tail);
+        const oscComplete = tail.startsWith('\x1b]') && (tail.includes('\x07') || tail.includes('\x1b\\'));
+        const tmuxComplete = tail.startsWith('\x1bPtmux;') && tail.includes('\x1b\\');
+        const doubledCsiComplete = /^\x1b\x1b\[[0-9;? ]*[ -/]*[@-~]/.test(tail);
+
+        if (csiComplete || oscComplete || tmuxComplete || doubledCsiComplete) {
+            return { processable: data, remainder: '' };
+        }
+
+        return {
+            processable: data.slice(0, lastEsc),
+            remainder: tail,
+        };
+    }
+
+    stripCursorControls(data) {
+        if (!data) {
+            return data;
+        }
+
+        let output = data;
+
+        // Unwrap tmux passthrough and sanitize nested payload.
+        output = output.replace(/\x1bPtmux;[\s\S]*?\x1b\\/g, (seq) => {
+            const payload = seq.slice(7, -2).replace(/\x1b\x1b/g, '\x1b');
+            return this.stripCursorControls(payload);
+        });
+
+        // Ignore cursor-shape controls so menu-selected style is authoritative.
+        output = output.replace(/\x1b\[[0-9; ]* q/g, '');
+
+        // Drop hide-cursor sequence (including tmux-doubled ESC variant).
+        output = output.replace(/(?:\x1b\x1b|\x1b)\[\?25l/g, '');
+
+        return output;
+    }
+
+    sanitizeTerminalOutput(data) {
+        const combined = this.outputSanitizeRemainder + (data || '');
+        this.outputSanitizeRemainder = '';
+
+        const { processable, remainder } = this.splitOutputRemainder(combined);
+        this.outputSanitizeRemainder = remainder;
+
+        if (!processable) {
+            return '';
+        }
+
+        const hadHideCursor = /(?:\x1b\x1b|\x1b)\[\?25l/.test(processable);
+        let output = this.stripCursorControls(processable);
+
+        if (hadHideCursor) {
+            output += '\x1b[?25h';
+        }
+
+        return output;
     }
 
     connect() {
@@ -818,11 +880,7 @@ class WebTerminal {
                 const message = JSON.parse(event.data);
 
                 if (message.type === 'output') {
-                    // Keep cursor shape controlled by WebTerm settings even if
-                    // nvim/tmux emits its own DECSCUSR cursor-shape sequences.
-                    const preferredShape = this.getPreferredCursorShapeSequence();
-                    const normalized = message.data.replace(/\x1b\[[0-9; ]* q/g, preferredShape);
-                    this.terminal.write(normalized);
+                    this.terminal.write(this.sanitizeTerminalOutput(message.data));
                 } else if (message.type === 'error') {
                     console.error('Server error:', message.message);
                     this.toast.error(message.message);

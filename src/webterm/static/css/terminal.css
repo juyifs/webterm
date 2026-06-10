@@ -461,6 +461,13 @@ body {
     cursor: text;
 }
 
+/* Keep block cursor visible in TUIs when blink is disabled. */
+.xterm .xterm-cursor.xterm-cursor-block {
+    border: 1px solid var(--wt-cursor, #f5e0dc) !important;
+    outline: 1px solid var(--wt-cursor, #f5e0dc) !important;
+    outline-offset: -1px;
+}
+
 /* Clickable stats */
 #system-stats .clickable {
     cursor: pointer;
