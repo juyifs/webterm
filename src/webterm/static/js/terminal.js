@@ -420,6 +420,9 @@ class WebTerminal {
         this.settingFontSize = document.getElementById('setting-font-size');
         this.settingCursorStyle = document.getElementById('setting-cursor-style');
         this.settingCursorBlink = document.getElementById('setting-cursor-blink');
+        this.settingCursorColorEnabled = document.getElementById('setting-cursor-color-enabled');
+        this.settingCursorColorRgb = document.getElementById('setting-cursor-color-rgb');
+        this.settingCursorColorOpacity = document.getElementById('setting-cursor-color-opacity');
 
         // State
         this.currentTheme = localStorage.getItem('webterm-theme') || 'catppuccin-mocha';
@@ -427,8 +430,28 @@ class WebTerminal {
         this.settings = savedSettings ? JSON.parse(savedSettings) : {
             fontSize: 14,
             cursorStyle: 'block',
-            cursorBlink: true
+            cursorBlink: true,
+            cursorColorEnabled: false,
+            cursorColorRgb: '',
+            cursorColorOpacity: 100
         };
+
+        if (!Object.prototype.hasOwnProperty.call(this.settings, 'cursorColorEnabled')) {
+            this.settings.cursorColorEnabled = Boolean((this.settings.cursorColorRgb || '').trim());
+        }
+
+        if (!Object.prototype.hasOwnProperty.call(this.settings, 'cursorColorRgb')) {
+            this.settings.cursorColorRgb = '';
+        }
+
+        if (!Object.prototype.hasOwnProperty.call(this.settings, 'cursorColorOpacity')) {
+            this.settings.cursorColorOpacity = 100;
+        }
+
+        const normalizedStoredCursorColor = this.normalizeHexColorInput(this.settings.cursorColorRgb);
+        this.settings.cursorColorRgb = normalizedStoredCursorColor === null ? '' : normalizedStoredCursorColor;
+        const normalizedStoredOpacity = this.normalizeOpacityInput(this.settings.cursorColorOpacity);
+        this.settings.cursorColorOpacity = normalizedStoredOpacity === null ? 100 : normalizedStoredOpacity;
 
         // PiP panel elements
         this.pipPanel = document.getElementById('stats-pip');
@@ -469,7 +492,7 @@ class WebTerminal {
 
         // Initialize terminal with saved settings
         this.terminal = new Terminal({
-            theme: themes[this.currentTheme],
+            theme: this.getEffectiveTheme(this.currentTheme),
             fontFamily: "'JetBrainsMono Nerd Font Mono', 'Menlo', 'Monaco', 'Consolas', monospace",
             fontSize: this.settings.fontSize,
             lineHeight: 1.2,
@@ -550,6 +573,10 @@ class WebTerminal {
         this.settingFontSize.value = this.settings.fontSize;
         this.settingCursorStyle.value = this.settings.cursorStyle;
         this.settingCursorBlink.checked = this.settings.cursorBlink;
+        this.settingCursorColorEnabled.checked = this.settings.cursorColorEnabled;
+        this.settingCursorColorRgb.value = this.settings.cursorColorRgb || '';
+        this.settingCursorColorOpacity.value = String(this.settings.cursorColorOpacity ?? 100);
+        this.updateCursorColorControls();
         this.themeSelect.value = this.currentTheme;
 
         // Events
@@ -559,10 +586,41 @@ class WebTerminal {
             if (e.target === this.settingsModal) this.settingsModal.classList.add('hidden');
         });
 
+        this.settingCursorColorEnabled.addEventListener('change', () => {
+            this.updateCursorColorControls();
+        });
+
         this.settingsSave.addEventListener('click', () => {
+            const cursorColorEnabled = this.settingCursorColorEnabled.checked;
+            let normalizedColor = this.normalizeHexColorInput(this.settingCursorColorRgb.value);
+            const normalizedOpacity = this.normalizeOpacityInput(this.settingCursorColorOpacity.value);
+            if (cursorColorEnabled) {
+                if (!normalizedColor) {
+                    this.toast.error('Enter hex color when custom cursor color is enabled');
+                    return;
+                }
+                if (normalizedColor === null) {
+                    this.toast.error('Invalid hex color. Use format like #f5e0dc');
+                    return;
+                }
+                if (normalizedOpacity === null) {
+                    this.toast.error('Invalid opacity. Use 0-100');
+                    return;
+                }
+            } else {
+                if (normalizedColor === null) {
+                    normalizedColor = this.settings.cursorColorRgb || '';
+                }
+            }
+
             this.settings.fontSize = parseInt(this.settingFontSize.value);
             this.settings.cursorStyle = this.settingCursorStyle.value;
             this.settings.cursorBlink = this.settingCursorBlink.checked;
+            this.settings.cursorColorEnabled = cursorColorEnabled;
+            this.settings.cursorColorRgb = normalizedColor;
+            this.settings.cursorColorOpacity = normalizedOpacity === null ? this.settings.cursorColorOpacity : normalizedOpacity;
+            this.settingCursorColorRgb.value = normalizedColor;
+            this.settingCursorColorOpacity.value = String(this.settings.cursorColorOpacity);
 
             // Save
             localStorage.setItem('webterm-settings', JSON.stringify(this.settings));
@@ -571,6 +629,8 @@ class WebTerminal {
             this.terminal.options.fontSize = this.settings.fontSize;
             this.terminal.options.cursorStyle = this.settings.cursorStyle;
             this.terminal.options.cursorBlink = this.settings.cursorBlink;
+            this.terminal.options.theme = this.getEffectiveTheme(this.currentTheme);
+            this.applyCssTheme(this.currentTheme);
 
             // Refit
             this.fitAddon.fit();
@@ -578,6 +638,12 @@ class WebTerminal {
             this.settingsModal.classList.add('hidden');
             this.toast.success('Settings saved');
         });
+    }
+
+    updateCursorColorControls() {
+        const enabled = this.settingCursorColorEnabled.checked;
+        this.settingCursorColorRgb.disabled = !enabled;
+        this.settingCursorColorOpacity.disabled = !enabled;
     }
 
     openSettings() {
@@ -759,7 +825,7 @@ class WebTerminal {
         localStorage.setItem('webterm-theme', themeName);
 
         // Update terminal theme
-        this.terminal.options.theme = themes[themeName];
+        this.terminal.options.theme = this.getEffectiveTheme(themeName);
 
         // Update CSS variables for UI
         this.applyCssTheme(themeName);
@@ -775,7 +841,89 @@ class WebTerminal {
         }
 
         // Keep cursor styling available to CSS overrides.
-        root.style.setProperty('--wt-cursor', themes[themeName].cursor);
+        root.style.setProperty('--wt-cursor', this.getEffectiveCursorColor(themeName));
+    }
+
+    normalizeHexColorInput(value) {
+        if (typeof value !== 'string') {
+            return '';
+        }
+
+        const input = value.trim();
+        if (!input) {
+            return '';
+        }
+
+        const hexMatch = input.match(/^#?([0-9a-f]{3}|[0-9a-f]{6})$/i);
+        if (hexMatch) {
+            let hex = hexMatch[1];
+            if (hex.length === 3) {
+                hex = hex.split('').map((c) => c + c).join('');
+            }
+            return `#${hex.toLowerCase()}`;
+        }
+
+        // Backward compatibility: normalize legacy RGB input to hex.
+        let parts;
+        const rgbMatch = input.match(/^rgb\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)$/i);
+        if (rgbMatch) {
+            parts = rgbMatch.slice(1, 4).map((v) => Number.parseInt(v, 10));
+        } else {
+            parts = input.split(',').map((v) => Number.parseInt(v.trim(), 10));
+        }
+
+        if (parts.length !== 3 || parts.some((v) => Number.isNaN(v) || v < 0 || v > 255)) {
+            return null;
+        }
+
+        return `#${parts.map((v) => v.toString(16).padStart(2, '0')).join('')}`;
+    }
+
+    normalizeOpacityInput(value) {
+        const numberValue = Number.parseFloat(String(value).trim());
+        if (Number.isNaN(numberValue) || numberValue < 0 || numberValue > 100) {
+            return null;
+        }
+        return Math.round(numberValue);
+    }
+
+    hexToRgbComponents(hexColor) {
+        const hex = hexColor.replace('#', '');
+        return {
+            r: Number.parseInt(hex.slice(0, 2), 16),
+            g: Number.parseInt(hex.slice(2, 4), 16),
+            b: Number.parseInt(hex.slice(4, 6), 16),
+        };
+    }
+
+    applyOpacityToColor(hexColor, opacityPercent) {
+        const { r, g, b } = this.hexToRgbComponents(hexColor);
+        const alpha = Math.max(0, Math.min(1, opacityPercent / 100));
+        return `rgba(${r}, ${g}, ${b}, ${alpha.toFixed(2)})`;
+    }
+
+    getEffectiveCursorColor(themeName) {
+        if (!this.settings.cursorColorEnabled) {
+            return themes[themeName].cursor;
+        }
+
+        const custom = this.normalizeHexColorInput(this.settings.cursorColorRgb);
+        if (!custom) {
+            return themes[themeName].cursor;
+        }
+        const opacity = this.normalizeOpacityInput(this.settings.cursorColorOpacity);
+        if (opacity === null) {
+            return custom;
+        }
+
+        return this.applyOpacityToColor(custom, opacity);
+    }
+
+    getEffectiveTheme(themeName) {
+        return {
+            ...themes[themeName],
+            cursor: this.getEffectiveCursorColor(themeName),
+        };
     }
 
     handleResize() {

@@ -463,9 +463,10 @@ body {
 
 /* Keep block cursor visible in TUIs when blink is disabled. */
 .xterm .xterm-cursor.xterm-cursor-block {
-    border: 1px solid var(--wt-cursor, #f5e0dc) !important;
-    outline: 1px solid var(--wt-cursor, #f5e0dc) !important;
-    outline-offset: -1px;
+    background-color: var(--wt-cursor, #f5e0dc) !important;
+    border: none !important;
+    outline: none !important;
+    box-shadow: none !important;
 }
 
 /* Clickable stats */
@@ -905,6 +906,7 @@ body {
 }
 
 .setting-group input[type="number"],
+.setting-group input[type="text"],
 .setting-group select {
     width: 100%;
     background-color: var(--ctp-base);
@@ -930,6 +932,7 @@ body {
 }
 
 .setting-group input[type="number"]:focus,
+.setting-group input[type="text"]:focus,
 .setting-group select:focus {
     border-color: var(--ctp-blue);
     box-shadow: 0 0 0 2px rgba(137, 180, 250, 0.2);

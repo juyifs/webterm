@@ -176,6 +176,16 @@
                             Cursor Blink
                         </label>
                     </div>
+                    <div class="setting-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="setting-cursor-color-enabled">
+                            Enable Custom Cursor Color
+                        </label>
+                        <label for="setting-cursor-color-rgb">Cursor Color (Hex RGB)</label>
+                        <input type="text" id="setting-cursor-color-rgb" placeholder="e.g. #f5e0dc">
+                        <label for="setting-cursor-color-opacity">Cursor Opacity (%)</label>
+                        <input type="number" id="setting-cursor-color-opacity" min="0" max="100" step="1" value="100">
+                    </div>
                 </div>
                 <div class="modal-footer">
                     <button id="settings-save" class="btn primary">Save</button>
