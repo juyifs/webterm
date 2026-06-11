@@ -80,6 +80,10 @@
         </div>
         <footer id="footer-bar">
             <span id="connection-status">Connecting...</span>
+            <button id="perf-indicator" class="footer-chip" title="Click to cycle performance profile">
+                PERF: --
+            </button>
+            <span id="perf-metrics" class="footer-metrics">RTT --ms | BUF -- | Q --</span>
             <div class="footer-spacer"></div>
             <button id="settings-btn" class="footer-btn" title="Settings">
                 <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
@@ -157,6 +161,16 @@
                             <option value="nord">Nord</option>
                             <option value="tokyo-night">Tokyo Night</option>
                         </select>
+                    </div>
+                    <div class="setting-group">
+                        <label for="setting-performance-profile">Performance Profile</label>
+                        <select id="setting-performance-profile">
+                            <option value="low-latency">Low Latency</option>
+                            <option value="balanced">Balanced</option>
+                            <option value="throughput">High Throughput</option>
+                            <option value="reading">Reading / Fast Scroll</option>
+                        </select>
+                        <small class="setting-help">Tip: Shift + Wheel accelerates scrolling, Alt + PageUp/PageDown jumps faster.</small>
                     </div>
                     <div class="setting-group">
                         <label for="setting-font-size">Font Size</label>

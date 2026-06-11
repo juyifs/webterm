@@ -195,6 +195,53 @@ const themeCssVars = {
     },
 };
 
+const PERFORMANCE_PROFILES = {
+    'low-latency': {
+        label: 'Low Latency',
+        inputFlushMinMs: 2,
+        inputFlushMaxMs: 10,
+        inputImmediateThreshold: 192,
+        outputRenderChunkSize: 96 * 1024,
+        fastScrollMultiplier: 7,
+        scrollSensitivity: 1.8,
+        fastScrollSensitivity: 7,
+        smoothScrollDuration: 0,
+    },
+    balanced: {
+        label: 'Balanced',
+        inputFlushMinMs: 2,
+        inputFlushMaxMs: 16,
+        inputImmediateThreshold: 256,
+        outputRenderChunkSize: 128 * 1024,
+        fastScrollMultiplier: 8,
+        scrollSensitivity: 2,
+        fastScrollSensitivity: 8,
+        smoothScrollDuration: 0,
+    },
+    throughput: {
+        label: 'High Throughput',
+        inputFlushMinMs: 4,
+        inputFlushMaxMs: 24,
+        inputImmediateThreshold: 512,
+        outputRenderChunkSize: 196 * 1024,
+        fastScrollMultiplier: 10,
+        scrollSensitivity: 2.4,
+        fastScrollSensitivity: 10,
+        smoothScrollDuration: 0,
+    },
+    reading: {
+        label: 'Reading / Fast Scroll',
+        inputFlushMinMs: 4,
+        inputFlushMaxMs: 24,
+        inputImmediateThreshold: 512,
+        outputRenderChunkSize: 220 * 1024,
+        fastScrollMultiplier: 16,
+        scrollSensitivity: 3,
+        fastScrollSensitivity: 12,
+        smoothScrollDuration: 0,
+    },
+};
+
 /**
  * Toast Notification Manager
  */
@@ -248,8 +295,11 @@ class CommandPalette {
         this.commands = [
             { id: 'toggle-explorer', name: 'Toggle File Explorer', action: () => this.app.toggleExplorer() },
             { id: 'open-settings', name: 'Open Settings', action: () => this.app.openSettings() },
+            { id: 'cycle-performance', name: 'Cycle Performance Profile', action: () => this.app.cyclePerformanceProfile() },
             { id: 'reload-terminal', name: 'Reload Terminal', action: () => window.location.reload() },
             { id: 'clear-terminal', name: 'Clear Terminal', action: () => this.app.terminal.clear() },
+            { id: 'scroll-top', name: 'Scroll To Top', action: () => this.app.terminal.scrollToTop() },
+            { id: 'scroll-bottom', name: 'Scroll To Bottom', action: () => this.app.terminal.scrollToBottom() },
             { id: 'upload-file', name: 'Upload File', action: () => this.app.fileInput.click() },
             { id: 'toggle-pip', name: 'Toggle System Monitor', action: () => this.app.togglePip() },
             {
@@ -409,6 +459,8 @@ class WebTerminal {
         this.cpuElement = document.getElementById('cpu-usage');
         this.memElement = document.getElementById('mem-usage');
         this.gpuElement = document.getElementById('gpu-usage');
+        this.perfIndicator = document.getElementById('perf-indicator');
+        this.perfMetrics = document.getElementById('perf-metrics');
         this.themeSelect = document.getElementById('theme-select');
         this.loadingOverlay = document.getElementById('loading-overlay');
 
@@ -420,6 +472,7 @@ class WebTerminal {
         this.settingFontSize = document.getElementById('setting-font-size');
         this.settingCursorStyle = document.getElementById('setting-cursor-style');
         this.settingCursorBlink = document.getElementById('setting-cursor-blink');
+        this.settingPerformanceProfile = document.getElementById('setting-performance-profile');
         this.settingCursorColorEnabled = document.getElementById('setting-cursor-color-enabled');
         this.settingCursorColorRgb = document.getElementById('setting-cursor-color-rgb');
         this.settingCursorColorOpacity = document.getElementById('setting-cursor-color-opacity');
@@ -429,6 +482,7 @@ class WebTerminal {
         const savedSettings = localStorage.getItem('webterm-settings');
         this.settings = savedSettings ? JSON.parse(savedSettings) : {
             fontSize: 14,
+            performanceProfile: 'balanced',
             cursorStyle: 'block',
             cursorBlink: true,
             cursorColorEnabled: false,
@@ -438,6 +492,14 @@ class WebTerminal {
 
         if (!Object.prototype.hasOwnProperty.call(this.settings, 'cursorColorEnabled')) {
             this.settings.cursorColorEnabled = Boolean((this.settings.cursorColorRgb || '').trim());
+        }
+
+        if (!Object.prototype.hasOwnProperty.call(this.settings, 'performanceProfile')) {
+            this.settings.performanceProfile = 'balanced';
+        }
+
+        if (!PERFORMANCE_PROFILES[this.settings.performanceProfile]) {
+            this.settings.performanceProfile = 'balanced';
         }
 
         if (!Object.prototype.hasOwnProperty.call(this.settings, 'cursorColorRgb')) {
@@ -484,6 +546,35 @@ class WebTerminal {
 
         // Buffer trailing partial ANSI sequences between websocket chunks.
         this.outputSanitizeRemainder = '';
+
+        // Input micro-batching reduces per-keystroke websocket overhead
+        // while keeping typing latency effectively real-time.
+        this.inputBuffer = '';
+        this.inputFlushTimer = null;
+        this.inputFlushIntervalMs = 8;
+        this.inputFlushMinMs = 2;
+        this.inputFlushMaxMs = 16;
+        this.inputImmediateThreshold = 256;
+        this.rttMs = 30;
+        this.rttPingTimer = null;
+        this.perfMetricsTimer = null;
+
+        // Binary protocol reduces JSON overhead for high-frequency terminal I/O.
+        this.protocolVersion = 2;
+        this.binaryProtocolEnabled = false;
+        this.binaryProtocolReady = false;
+        this.binOutputFrame = 0x01;
+        this.binInputFrame = 0x10;
+        this.textEncoder = new TextEncoder();
+        this.textDecoder = new TextDecoder();
+
+        // Render output in frame-sized chunks for smoother UI during heavy streaming.
+        this.pendingTerminalOutput = '';
+        this.outputRenderScheduled = false;
+        this.outputRenderChunkSize = 128 * 1024;
+
+        // Large text navigation tuning.
+        this.fastScrollMultiplier = 8;
     }
 
     init() {
@@ -500,6 +591,10 @@ class WebTerminal {
             cursorStyle: this.settings.cursorStyle,
             cursorInactiveStyle: 'block',
             scrollback: 10000,
+            scrollSensitivity: 2,
+            fastScrollSensitivity: 8,
+            fastScrollModifier: 'alt',
+            smoothScrollDuration: 0,
             convertEol: false,
             allowProposedApi: true,
         });
@@ -530,6 +625,14 @@ class WebTerminal {
         const ensureTerminalFocus = () => this.terminal.focus();
         container.addEventListener('mousedown', ensureTerminalFocus);
         container.addEventListener('wheel', ensureTerminalFocus, { passive: true });
+        this.initFastScrollShortcuts();
+
+        if (this.perfIndicator) {
+            this.perfIndicator.addEventListener('click', () => this.cyclePerformanceProfile());
+        }
+
+        this.applyPerformanceProfile(this.settings.performanceProfile, false);
+        this.updatePerformanceBadge();
 
         // Initialize Command Palette
         this.commandPalette = new CommandPalette(this);
@@ -539,7 +642,7 @@ class WebTerminal {
 
         // Handle input
         this.terminal.onData((data) => {
-            this.send({ type: 'input', data: data });
+            this.queueInput(data);
         });
 
         // Handle resize
@@ -566,11 +669,14 @@ class WebTerminal {
 
         // Connect to WebSocket
         this.connect();
+
+        this.startPerfMetricsTicker();
     }
 
     initSettings() {
         // Populate inputs
         this.settingFontSize.value = this.settings.fontSize;
+        this.settingPerformanceProfile.value = this.settings.performanceProfile;
         this.settingCursorStyle.value = this.settings.cursorStyle;
         this.settingCursorBlink.checked = this.settings.cursorBlink;
         this.settingCursorColorEnabled.checked = this.settings.cursorColorEnabled;
@@ -614,6 +720,7 @@ class WebTerminal {
             }
 
             this.settings.fontSize = parseInt(this.settingFontSize.value);
+            this.settings.performanceProfile = this.settingPerformanceProfile.value;
             this.settings.cursorStyle = this.settingCursorStyle.value;
             this.settings.cursorBlink = this.settingCursorBlink.checked;
             this.settings.cursorColorEnabled = cursorColorEnabled;
@@ -631,6 +738,7 @@ class WebTerminal {
             this.terminal.options.cursorBlink = this.settings.cursorBlink;
             this.terminal.options.theme = this.getEffectiveTheme(this.currentTheme);
             this.applyCssTheme(this.currentTheme);
+            this.applyPerformanceProfile(this.settings.performanceProfile, false);
 
             // Refit
             this.fitAddon.fit();
@@ -648,6 +756,72 @@ class WebTerminal {
 
     openSettings() {
         this.settingsModal.classList.remove('hidden');
+    }
+
+    applyPerformanceProfile(profileName, showToast = true) {
+        const profile = PERFORMANCE_PROFILES[profileName] || PERFORMANCE_PROFILES.balanced;
+
+        this.settings.performanceProfile = profileName in PERFORMANCE_PROFILES ? profileName : 'balanced';
+        this.inputFlushMinMs = profile.inputFlushMinMs;
+        this.inputFlushMaxMs = profile.inputFlushMaxMs;
+        this.inputImmediateThreshold = profile.inputImmediateThreshold;
+        this.outputRenderChunkSize = profile.outputRenderChunkSize;
+        this.fastScrollMultiplier = profile.fastScrollMultiplier;
+
+        if (this.terminal) {
+            this.terminal.options.scrollSensitivity = profile.scrollSensitivity;
+            this.terminal.options.fastScrollSensitivity = profile.fastScrollSensitivity;
+            this.terminal.options.smoothScrollDuration = profile.smoothScrollDuration;
+        }
+
+        if (this.settingPerformanceProfile) {
+            this.settingPerformanceProfile.value = this.settings.performanceProfile;
+        }
+
+        this.updatePerformanceBadge();
+        if (showToast) {
+            this.toast.info(`Performance profile: ${profile.label}`);
+        }
+    }
+
+    cyclePerformanceProfile() {
+        const profiles = Object.keys(PERFORMANCE_PROFILES);
+        const currentIndex = Math.max(0, profiles.indexOf(this.settings.performanceProfile));
+        const nextProfile = profiles[(currentIndex + 1) % profiles.length];
+        this.applyPerformanceProfile(nextProfile, true);
+        localStorage.setItem('webterm-settings', JSON.stringify(this.settings));
+    }
+
+    updatePerformanceBadge() {
+        if (this.perfIndicator) {
+            const profile = PERFORMANCE_PROFILES[this.settings.performanceProfile] || PERFORMANCE_PROFILES.balanced;
+            this.perfIndicator.textContent = `PERF: ${profile.label}`;
+        }
+    }
+
+    startPerfMetricsTicker() {
+        this.stopPerfMetricsTicker();
+        this.perfMetricsTimer = setInterval(() => this.updatePerfMetrics(), 800);
+        this.updatePerfMetrics();
+    }
+
+    stopPerfMetricsTicker() {
+        if (!this.perfMetricsTimer) {
+            return;
+        }
+        clearInterval(this.perfMetricsTimer);
+        this.perfMetricsTimer = null;
+    }
+
+    updatePerfMetrics() {
+        if (!this.perfMetrics) {
+            return;
+        }
+
+        const bufferedBytes = this.socket ? this.socket.bufferedAmount : 0;
+        const queueBytes = this.pendingTerminalOutput.length;
+        const protocol = this.binaryProtocolEnabled ? 'BIN' : 'JSON';
+        this.perfMetrics.textContent = `RTT ${this.rttMs.toFixed(0)}ms | BUF ${Math.round(bufferedBytes / 1024)}KB | Q ${Math.round(queueBytes / 1024)}KB | ${protocol}`;
     }
 
     togglePip() {
@@ -769,7 +943,8 @@ class WebTerminal {
             if (event.ctrlKey && event.shiftKey && event.key === 'V') {
                 if (event.type === 'keydown') {
                     navigator.clipboard.readText().then(text => {
-                        this.send({ type: 'input', data: text });
+                        this.queueInput(text);
+                        this.flushInputBuffer();
                     }).catch(err => {
                         console.error('Failed to paste:', err);
                         this.toast.error('Failed to read from clipboard');
@@ -792,7 +967,8 @@ class WebTerminal {
             } else {
                 // If no selection, paste
                 navigator.clipboard.readText().then(text => {
-                    this.send({ type: 'input', data: text });
+                    this.queueInput(text);
+                    this.flushInputBuffer();
                 }).catch(err => this.toast.error('Failed to paste'));
             }
         });
@@ -1011,6 +1187,11 @@ class WebTerminal {
 
         this.setStatus('connecting', 'Connecting...');
         this.socket = new WebSocket(wsUrl);
+        this.socket.binaryType = 'arraybuffer';
+        this.binaryProtocolEnabled = false;
+        this.binaryProtocolReady = false;
+        this.textDecoder = new TextDecoder();
+        this.stopRttPing();
 
         this.socket.onopen = () => {
             this.reconnectAttempts = 0;
@@ -1018,17 +1199,31 @@ class WebTerminal {
             this.setStatus('connected', 'Connected');
             this.loadingOverlay.classList.add('hidden');
 
+            // Negotiate optional binary protocol (falls back to JSON automatically).
+            this.send({ type: 'hello', version: this.protocolVersion, binary: true });
+            this.startRttPing();
+
             // Send initial resize
             const { rows, cols } = this.terminal;
             this.send({ type: 'resize', rows: rows, cols: cols });
         };
 
         this.socket.onmessage = (event) => {
+            if (event.data instanceof ArrayBuffer) {
+                this.handleBinaryMessage(new Uint8Array(event.data));
+                return;
+            }
+
             try {
                 const message = JSON.parse(event.data);
 
                 if (message.type === 'output') {
-                    this.terminal.write(this.sanitizeTerminalOutput(message.data));
+                    this.enqueueTerminalOutput(message.data);
+                } else if (message.type === 'protocol') {
+                    this.binaryProtocolEnabled = Boolean(message.binary);
+                    this.binaryProtocolReady = true;
+                } else if (message.type === 'pong') {
+                    this.updateRttFromPong(message.t);
                 } else if (message.type === 'error') {
                     console.error('Server error:', message.message);
                     this.toast.error(message.message);
@@ -1044,6 +1239,7 @@ class WebTerminal {
 
         this.socket.onclose = () => {
             this.isConnected = false;
+            this.stopRttPing();
             this.setStatus('disconnected', 'Disconnected');
             this.attemptReconnect();
         };
@@ -1052,6 +1248,128 @@ class WebTerminal {
             console.error('WebSocket error:', error);
             this.isConnected = false;
         };
+    }
+
+    handleBinaryMessage(frame) {
+        if (!frame || frame.length < 1) {
+            return;
+        }
+
+        const frameType = frame[0];
+        const payload = frame.slice(1);
+
+        if (frameType === this.binOutputFrame) {
+            const text = this.textDecoder.decode(payload, { stream: true });
+            if (text) {
+                this.enqueueTerminalOutput(text);
+            }
+        }
+    }
+
+    enqueueTerminalOutput(rawChunk) {
+        const sanitized = this.sanitizeTerminalOutput(rawChunk);
+        if (!sanitized) {
+            return;
+        }
+
+        this.pendingTerminalOutput += sanitized;
+        if (this.outputRenderScheduled) {
+            return;
+        }
+
+        this.outputRenderScheduled = true;
+        requestAnimationFrame(() => this.flushTerminalOutputFrame());
+    }
+
+    flushTerminalOutputFrame() {
+        this.outputRenderScheduled = false;
+        if (!this.pendingTerminalOutput) {
+            return;
+        }
+
+        const chunk = this.pendingTerminalOutput.slice(0, this.outputRenderChunkSize);
+        this.pendingTerminalOutput = this.pendingTerminalOutput.slice(chunk.length);
+        this.terminal.write(chunk);
+
+        if (this.pendingTerminalOutput) {
+            this.outputRenderScheduled = true;
+            requestAnimationFrame(() => this.flushTerminalOutputFrame());
+        }
+    }
+
+    startRttPing() {
+        this.stopRttPing();
+        this.rttPingTimer = setInterval(() => {
+            if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+                return;
+            }
+            this.send({ type: 'ping', t: performance.now() });
+        }, 5000);
+    }
+
+    stopRttPing() {
+        if (!this.rttPingTimer) {
+            return;
+        }
+        clearInterval(this.rttPingTimer);
+        this.rttPingTimer = null;
+    }
+
+    updateRttFromPong(sentAt) {
+        if (typeof sentAt !== 'number') {
+            return;
+        }
+        const sample = Math.max(1, performance.now() - sentAt);
+        this.rttMs = this.rttMs * 0.8 + sample * 0.2;
+    }
+
+    updateInputFlushInterval() {
+        const base = Math.round(this.rttMs / 4);
+        let interval = Math.max(this.inputFlushMinMs, Math.min(this.inputFlushMaxMs, base));
+
+        // If socket write buffer is growing, widen batching to reduce frame pressure.
+        if (this.socket && this.socket.bufferedAmount > 256 * 1024) {
+            interval = this.inputFlushMaxMs;
+        }
+
+        this.inputFlushIntervalMs = interval;
+    }
+
+    initFastScrollShortcuts() {
+        const terminalElement = this.terminal.element;
+        if (!terminalElement) {
+            return;
+        }
+
+        // Shift+wheel accelerates long-text browsing without affecting normal scroll.
+        terminalElement.addEventListener('wheel', (e) => {
+            if (!e.shiftKey) {
+                return;
+            }
+
+            e.preventDefault();
+            const delta = e.deltaY > 0 ? 1 : -1;
+            this.terminal.scrollLines(delta * this.fastScrollMultiplier);
+        }, { passive: false });
+
+        // Alt+PageUp/PageDown for fast jump in long outputs.
+        terminalElement.addEventListener('keydown', (e) => {
+            if (!e.altKey || (e.key !== 'PageUp' && e.key !== 'PageDown')) {
+                if (e.altKey && e.key === 'Home') {
+                    e.preventDefault();
+                    this.terminal.scrollToTop();
+                } else if (e.altKey && e.key === 'End') {
+                    e.preventDefault();
+                    this.terminal.scrollToBottom();
+                }
+                return;
+            }
+
+            e.preventDefault();
+            const page = this.terminal.rows || 24;
+            const direction = e.key === 'PageDown' ? 1 : -1;
+            this.terminal.scrollLines(direction * page * 3);
+        });
     }
 
     updateStats(stats) {
@@ -1167,6 +1485,61 @@ class WebTerminal {
     send(message) {
         if (this.socket && this.socket.readyState === WebSocket.OPEN) {
             this.socket.send(JSON.stringify(message));
+        }
+    }
+
+    queueInput(data) {
+        this.updateInputFlushInterval();
+        this.inputBuffer += data;
+
+        // Flush immediately for command submit and larger paste bursts.
+        if (data.includes('\r') || data.includes('\n') || this.inputBuffer.length >= this.inputImmediateThreshold) {
+            this.flushInputBuffer();
+            return;
+        }
+
+        if (!this.inputFlushTimer) {
+            this.inputFlushTimer = setTimeout(() => {
+                this.flushInputBuffer();
+            }, this.inputFlushIntervalMs);
+        }
+    }
+
+    flushInputBuffer() {
+        if (this.inputFlushTimer) {
+            clearTimeout(this.inputFlushTimer);
+            this.inputFlushTimer = null;
+        }
+
+        if (!this.inputBuffer) {
+            return;
+        }
+
+        if (!this.sendBinaryInput(this.inputBuffer)) {
+            this.send({ type: 'input', data: this.inputBuffer });
+        }
+        this.inputBuffer = '';
+    }
+
+    sendBinaryInput(data) {
+        if (!this.binaryProtocolReady || !this.binaryProtocolEnabled) {
+            return false;
+        }
+
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+            return false;
+        }
+
+        try {
+            const payload = this.textEncoder.encode(data);
+            const frame = new Uint8Array(payload.length + 1);
+            frame[0] = this.binInputFrame;
+            frame.set(payload, 1);
+            this.socket.send(frame);
+            return true;
+        } catch (e) {
+            console.error('Failed to send binary input, falling back to JSON:', e);
+            return false;
         }
     }
 

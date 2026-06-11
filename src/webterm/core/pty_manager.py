@@ -84,14 +84,24 @@ class PTYManager:
             return None
 
         try:
-            loop = asyncio.get_event_loop()
-            data = await loop.run_in_executor(None, self._blocking_read, size)
-            return data
+            return os.read(self.fd, size)
+        except (OSError, BlockingIOError):
+            return None
         except Exception:
             return None
 
-    def _blocking_read(self, size: int) -> Optional[bytes]:
-        """Blocking read from PTY fd."""
+    def read_nowait(self, size: int = 4096) -> Optional[bytes]:
+        """Try to read from PTY fd without waiting.
+
+        Args:
+            size: Maximum bytes to read
+
+        Returns:
+            Bytes read or None if no data/error
+        """
+        if not self._running or self.fd is None:
+            return None
+
         try:
             return os.read(self.fd, size)
         except (OSError, BlockingIOError):
@@ -110,8 +120,18 @@ class PTYManager:
             return False
 
         try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, os.write, self.fd, data)
+            total_written = 0
+            data_len = len(data)
+
+            while total_written < data_len:
+                try:
+                    written = os.write(self.fd, data[total_written:])
+                    if written <= 0:
+                        return False
+                    total_written += written
+                except BlockingIOError:
+                    await asyncio.sleep(0)
+
             return True
         except Exception as e:
             logger.error(f"Failed to write to PTY: {e}")
