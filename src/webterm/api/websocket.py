@@ -13,6 +13,7 @@ from webterm.logger import get_logger
 logger = get_logger("websocket")
 
 STATS_INTERVAL = 2.0  # seconds between stats updates
+STATS_INTERVAL_HIGH_LATENCY = 5.0
 OUTPUT_BATCH_WINDOW = 0.004  # seconds to coalesce PTY output burst
 OUTPUT_BATCH_MAX_BYTES = 64 * 1024
 OUTPUT_BATCH_WINDOW_MIN = 0.002
@@ -30,6 +31,8 @@ class WebSocketManager:
         self._detailed_stats: dict[WebSocket, bool] = {}
         self._binary_protocol: dict[WebSocket, bool] = {}
         self._output_batch_window: dict[WebSocket, float] = {}
+        self._output_queues: dict[WebSocket, asyncio.Queue[bytes]] = {}
+        self._high_latency_mode: dict[WebSocket, bool] = {}
 
     async def handle_connection(self, websocket: WebSocket) -> None:
         """Handle a WebSocket connection.
@@ -54,8 +57,10 @@ class WebSocketManager:
             self._detailed_stats[websocket] = False
             self._binary_protocol[websocket] = False
             self._output_batch_window[websocket] = OUTPUT_BATCH_WINDOW
+            self._high_latency_mode[websocket] = False
 
             output_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=128)
+            self._output_queues[websocket] = output_queue
 
             # Start reading from PTY and forwarding to WebSocket
             read_task = asyncio.create_task(self._read_pty_loop(websocket, session, output_queue))
@@ -94,6 +99,8 @@ class WebSocketManager:
             self._detailed_stats.pop(websocket, None)
             self._binary_protocol.pop(websocket, None)
             self._output_batch_window.pop(websocket, None)
+            self._output_queues.pop(websocket, None)
+            self._high_latency_mode.pop(websocket, None)
             if session:
                 await session_manager.remove_session(session.id)
 
@@ -135,7 +142,7 @@ class WebSocketManager:
     async def _enqueue_output(self, output_queue: asyncio.Queue[bytes], payload: bytes) -> None:
         """Queue PTY output for websocket sending.
 
-        When queue is full, append to the newest queued chunk to avoid blocking input path.
+        When queue is full, drop oldest chunk and keep newest output to reduce tail latency.
         """
         if not payload:
             return
@@ -144,9 +151,9 @@ class WebSocketManager:
             output_queue.put_nowait(payload)
         except asyncio.QueueFull:
             try:
-                latest = output_queue.get_nowait()
-                merged = latest + payload
-                output_queue.put_nowait(merged)
+                # Favor freshest terminal state over stale backlog under congestion.
+                output_queue.get_nowait()
+                output_queue.put_nowait(payload)
             except Exception:
                 # If still congested, drop this burst chunk and continue.
                 pass
@@ -174,11 +181,15 @@ class WebSocketManager:
     def _adapt_output_batch_window(self, websocket: WebSocket, send_latency: float) -> None:
         """Adapt PTY read-side batching window by websocket send latency."""
         current = self._output_batch_window.get(websocket, OUTPUT_BATCH_WINDOW)
+        high_latency = self._high_latency_mode.get(websocket, False)
+
+        window_min = 0.004 if high_latency else OUTPUT_BATCH_WINDOW_MIN
+        window_max = 0.02 if high_latency else OUTPUT_BATCH_WINDOW_MAX
 
         if send_latency > 0.008:
-            current = min(OUTPUT_BATCH_WINDOW_MAX, current + 0.001)
+            current = min(window_max, current + 0.001)
         elif send_latency < 0.003:
-            current = max(OUTPUT_BATCH_WINDOW_MIN, current - 0.0005)
+            current = max(window_min, current - 0.0005)
 
         self._output_batch_window[websocket] = current
 
@@ -260,6 +271,9 @@ class WebSocketManager:
             # RTT probe for client-side adaptive input batching.
             await websocket.send_json({"type": "pong", "t": message.get("t")})
 
+        elif msg_type == "latency_mode":
+            self._high_latency_mode[websocket] = bool(message.get("high", False))
+
         else:
             logger.warning(f"Unknown message type: {msg_type}")
 
@@ -318,8 +332,14 @@ class WebSocketManager:
         """
         while True:
             try:
+                # During heavy output bursts, let terminal frames take priority.
+                queue = self._output_queues.get(websocket)
+                if queue and queue.qsize() > 0:
+                    await asyncio.sleep(STATS_INTERVAL_HIGH_LATENCY if self._high_latency_mode.get(websocket, False) else STATS_INTERVAL)
+                    continue
+
                 await self._send_stats(websocket)
-                await asyncio.sleep(STATS_INTERVAL)
+                await asyncio.sleep(STATS_INTERVAL_HIGH_LATENCY if self._high_latency_mode.get(websocket, False) else STATS_INTERVAL)
             except Exception:
                 break
 

@@ -444,11 +444,13 @@ class WebTerminal {
         this.terminal = null;
         this.fitAddon = null;
         this.webLinksAddon = null;
+        this.webglAddon = null;
         this.socket = null;
         this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 10;
         this.reconnectDelay = 1000;
         this.isConnected = false;
+        this.fontReady = false;
 
         // Components
         this.toast = new ToastManager();
@@ -538,6 +540,10 @@ class WebTerminal {
         this.explorerVisible = false;
         this.currentPath = '~';
         this.pathHistory = [];
+        this.preloadedCwd = null;
+        this.directoryCache = new Map();
+        this.directoryCacheTtlMs = 15000;
+        this.contextWarmupDone = false;
 
         // Clipboard state
         this.autoCopyEnabled = true;
@@ -557,6 +563,9 @@ class WebTerminal {
         this.inputImmediateThreshold = 256;
         this.rttMs = 30;
         this.rttPingTimer = null;
+        this.highLatencyMode = false;
+        this.highLatencyEnterMs = 140;
+        this.highLatencyExitMs = 110;
         this.perfMetricsTimer = null;
 
         // Binary protocol reduces JSON overhead for high-frequency terminal I/O.
@@ -569,15 +578,30 @@ class WebTerminal {
         this.textDecoder = new TextDecoder();
 
         // Render output in frame-sized chunks for smoother UI during heavy streaming.
-        this.pendingTerminalOutput = '';
+        this.pendingTerminalOutputChunks = [];
+        this.pendingTerminalOutputBytes = 0;
+        this.preparedTerminalOutputChunks = [];
+        this.preparedTerminalOutputBytes = 0;
         this.outputRenderScheduled = false;
+        this.outputPrepareScheduled = false;
+        this.deferredRenderTimer = null;
         this.outputRenderChunkSize = 128 * 1024;
+        this.outputRenderChunkMin = 32 * 1024;
+        this.outputRenderChunkMax = 256 * 1024;
+        this.outputRenderTargetFrameMs = 7.5;
+        this.outputPrepareChunkSize = 64 * 1024;
+        this.outputPrepareLookaheadBytes = 1024 * 1024;
+
+        // Scroll interaction state: preserve manual scrolling smoothness under heavy output.
+        this.isUserScrolling = false;
+        this.scrollSettleTimer = null;
+        this.scrollSettleDelayMs = 140;
 
         // Large text navigation tuning.
         this.fastScrollMultiplier = 8;
     }
 
-    init() {
+    async init() {
         // Apply Settings Logic
         this.initSettings();
 
@@ -586,7 +610,10 @@ class WebTerminal {
             theme: this.getEffectiveTheme(this.currentTheme),
             fontFamily: "'JetBrainsMono Nerd Font Mono', 'Menlo', 'Monaco', 'Consolas', monospace",
             fontSize: this.settings.fontSize,
-            lineHeight: 1.2,
+            lineHeight: 1,
+            letterSpacing: 0,
+            customGlyphs: true,
+            rescaleOverlappingGlyphs: true,
             cursorBlink: this.settings.cursorBlink,
             cursorStyle: this.settings.cursorStyle,
             cursorInactiveStyle: 'block',
@@ -610,6 +637,20 @@ class WebTerminal {
         this.terminal.loadAddon(this.fitAddon);
         this.terminal.loadAddon(this.webLinksAddon);
 
+        // Prefer WebGL renderer when available for smoother high-volume output.
+        if (typeof WebglAddon !== 'undefined' && WebglAddon.WebglAddon) {
+            try {
+                this.webglAddon = new WebglAddon.WebglAddon();
+                this.terminal.loadAddon(this.webglAddon);
+                this.webglAddon.onContextLoss(() => {
+                    this.toast.warning('WebGL context lost, renderer fallback active');
+                });
+            } catch (error) {
+                console.warn('WebGL renderer unavailable, using default renderer:', error);
+                this.webglAddon = null;
+            }
+        }
+
         // Load clipboard addon if available
         if (typeof ClipboardAddon !== 'undefined') {
             this.clipboardAddon = new ClipboardAddon.ClipboardAddon();
@@ -619,12 +660,13 @@ class WebTerminal {
         // Open terminal in container
         const container = document.getElementById('terminal');
         this.terminal.open(container);
-        this.fitAddon.fit();
+        await this.stabilizeTerminalLayout();
         this.terminal.focus();
 
         const ensureTerminalFocus = () => this.terminal.focus();
         container.addEventListener('mousedown', ensureTerminalFocus);
         container.addEventListener('wheel', ensureTerminalFocus, { passive: true });
+        this.observeTerminalScroll();
         this.initFastScrollShortcuts();
 
         if (this.perfIndicator) {
@@ -647,6 +689,17 @@ class WebTerminal {
 
         // Handle resize
         window.addEventListener('resize', () => this.handleResize());
+        window.addEventListener('load', () => {
+            this.stabilizeTerminalLayout();
+        });
+        window.addEventListener('pageshow', () => {
+            this.stabilizeTerminalLayout();
+        });
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) {
+                this.stabilizeTerminalLayout();
+            }
+        });
         this.terminal.onResize(({ rows, cols }) => {
             this.send({ type: 'resize', rows: rows, cols: cols });
         });
@@ -765,7 +818,10 @@ class WebTerminal {
         this.inputFlushMinMs = profile.inputFlushMinMs;
         this.inputFlushMaxMs = profile.inputFlushMaxMs;
         this.inputImmediateThreshold = profile.inputImmediateThreshold;
-        this.outputRenderChunkSize = profile.outputRenderChunkSize;
+        this.outputRenderChunkSize = Math.max(
+            this.outputRenderChunkMin,
+            Math.min(this.outputRenderChunkMax, profile.outputRenderChunkSize)
+        );
         this.fastScrollMultiplier = profile.fastScrollMultiplier;
 
         if (this.terminal) {
@@ -819,9 +875,10 @@ class WebTerminal {
         }
 
         const bufferedBytes = this.socket ? this.socket.bufferedAmount : 0;
-        const queueBytes = this.pendingTerminalOutput.length;
+        const queueBytes = this.pendingTerminalOutputBytes + this.preparedTerminalOutputBytes;
         const protocol = this.binaryProtocolEnabled ? 'BIN' : 'JSON';
-        this.perfMetrics.textContent = `RTT ${this.rttMs.toFixed(0)}ms | BUF ${Math.round(bufferedBytes / 1024)}KB | Q ${Math.round(queueBytes / 1024)}KB | ${protocol}`;
+        const mode = this.highLatencyMode ? 'HL' : 'NL';
+        this.perfMetrics.textContent = `RTT ${this.rttMs.toFixed(0)}ms | BUF ${Math.round(bufferedBytes / 1024)}KB | Q ${Math.round(queueBytes / 1024)}KB | CHK ${Math.round(this.outputRenderChunkSize / 1024)}KB | ${mode} | ${protocol}`;
     }
 
     togglePip() {
@@ -1106,6 +1163,48 @@ class WebTerminal {
         if (this.fitAddon) {
             this.fitAddon.fit();
         }
+
+        if (this.terminal && this.terminal.rows > 0) {
+            this.terminal.refresh(0, this.terminal.rows - 1);
+        }
+    }
+
+    async waitForTerminalFont(timeoutMs = 2000) {
+        if (this.fontReady) {
+            return;
+        }
+
+        if (!document.fonts || !document.fonts.ready) {
+            this.fontReady = true;
+            return;
+        }
+
+        try {
+            await Promise.race([
+                Promise.all([
+                    document.fonts.ready,
+                    document.fonts.load(`400 ${this.settings.fontSize}px "JetBrainsMono Nerd Font Mono"`),
+                ]),
+                new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+            ]);
+        } catch (_) {
+            // Continue with fallback fonts if custom font probing fails.
+        }
+
+        this.fontReady = true;
+    }
+
+    async stabilizeTerminalLayout() {
+        await this.waitForTerminalFont();
+
+        for (let i = 0; i < 3; i++) {
+            await new Promise((resolve) => {
+                requestAnimationFrame(() => {
+                    this.handleResize();
+                    resolve();
+                });
+            });
+        }
     }
 
     splitOutputRemainder(data) {
@@ -1199,9 +1298,16 @@ class WebTerminal {
             this.setStatus('connected', 'Connected');
             this.loadingOverlay.classList.add('hidden');
 
+            this.pendingTerminalOutputChunks = [];
+            this.pendingTerminalOutputBytes = 0;
+            this.preparedTerminalOutputChunks = [];
+            this.preparedTerminalOutputBytes = 0;
+
             // Negotiate optional binary protocol (falls back to JSON automatically).
             this.send({ type: 'hello', version: this.protocolVersion, binary: true });
             this.startRttPing();
+
+            this.warmupContext();
 
             // Send initial resize
             const { rows, cols } = this.terminal;
@@ -1230,7 +1336,12 @@ class WebTerminal {
                 } else if (message.type === 'stats') {
                     this.updateStats(message);
                 } else if (message.type === 'cwd') {
-                    this.loadDirectory(message.path);
+                    this.preloadedCwd = message.path;
+                    if (this.explorerVisible) {
+                        this.loadDirectory(message.path);
+                    } else {
+                        this.prefetchDirectory(message.path);
+                    }
                 }
             } catch (e) {
                 console.error('Failed to parse message:', e);
@@ -1272,7 +1383,9 @@ class WebTerminal {
             return;
         }
 
-        this.pendingTerminalOutput += sanitized;
+        this.pendingTerminalOutputChunks.push(sanitized);
+        this.pendingTerminalOutputBytes += sanitized.length;
+        this.scheduleOutputPrepare();
         if (this.outputRenderScheduled) {
             return;
         }
@@ -1283,17 +1396,188 @@ class WebTerminal {
 
     flushTerminalOutputFrame() {
         this.outputRenderScheduled = false;
-        if (!this.pendingTerminalOutput) {
+        if (this.pendingTerminalOutputBytes <= 0 && this.preparedTerminalOutputBytes <= 0) {
             return;
         }
 
-        const chunk = this.pendingTerminalOutput.slice(0, this.outputRenderChunkSize);
-        this.pendingTerminalOutput = this.pendingTerminalOutput.slice(chunk.length);
-        this.terminal.write(chunk);
+        if (this.shouldDeferLiveRender()) {
+            this.scheduleDeferredRender();
+            this.scheduleOutputPrepare();
+            return;
+        }
 
-        if (this.pendingTerminalOutput) {
+        const renderBudget = this.getCurrentRenderBudget();
+        const frameStart = performance.now();
+        const chunk = this.dequeueRenderableChunk(renderBudget);
+        if (!chunk) {
+            return;
+        }
+        this.terminal.write(chunk);
+        const frameCostMs = performance.now() - frameStart;
+
+        this.adaptOutputRenderChunk(frameCostMs);
+
+        if (this.pendingTerminalOutputBytes > 0 || this.preparedTerminalOutputBytes > 0) {
             this.outputRenderScheduled = true;
             requestAnimationFrame(() => this.flushTerminalOutputFrame());
+        }
+    }
+
+    scheduleOutputPrepare() {
+        if (this.outputPrepareScheduled) {
+            return;
+        }
+
+        this.outputPrepareScheduled = true;
+        const runner = (deadlineMs = 8) => {
+            this.outputPrepareScheduled = false;
+            this.prepareOutputLookahead(deadlineMs);
+        };
+
+        if (typeof requestIdleCallback === 'function') {
+            requestIdleCallback((deadline) => {
+                const timeLeft = Math.max(4, Math.floor(deadline.timeRemaining()));
+                runner(timeLeft);
+            }, { timeout: 24 });
+        } else {
+            setTimeout(() => runner(8), 0);
+        }
+    }
+
+    prepareOutputLookahead(deadlineMs) {
+        const started = performance.now();
+        while (
+            this.pendingTerminalOutputBytes > 0 &&
+            this.preparedTerminalOutputBytes < this.outputPrepareLookaheadBytes &&
+            performance.now() - started < deadlineMs
+        ) {
+            const chunk = this.dequeueOutputChunk(this.outputPrepareChunkSize);
+            if (!chunk) {
+                break;
+            }
+            this.preparedTerminalOutputChunks.push(chunk);
+            this.preparedTerminalOutputBytes += chunk.length;
+        }
+
+        if (this.pendingTerminalOutputBytes > 0 && this.preparedTerminalOutputBytes < this.outputPrepareLookaheadBytes) {
+            this.scheduleOutputPrepare();
+        }
+    }
+
+    shouldDeferLiveRender() {
+        return this.isUserScrolling && this.isViewingHistory();
+    }
+
+    scheduleDeferredRender() {
+        if (this.deferredRenderTimer) {
+            return;
+        }
+
+        this.deferredRenderTimer = setTimeout(() => {
+            this.deferredRenderTimer = null;
+            if (!this.outputRenderScheduled && (this.pendingTerminalOutputBytes > 0 || this.preparedTerminalOutputBytes > 0)) {
+                this.outputRenderScheduled = true;
+                requestAnimationFrame(() => this.flushTerminalOutputFrame());
+            }
+        }, 48);
+    }
+
+    getCurrentRenderBudget() {
+        // When user is browsing scrollback, reduce per-frame workload to keep scrolling fluid.
+        if (this.isViewingHistory()) {
+            return Math.max(this.outputRenderChunkMin, Math.floor(this.outputRenderChunkSize * 0.55));
+        }
+        return this.outputRenderChunkSize;
+    }
+
+    isViewingHistory() {
+        if (!this.terminal || !this.terminal.buffer || !this.terminal.buffer.active) {
+            return false;
+        }
+
+        const buffer = this.terminal.buffer.active;
+        return buffer.viewportY < buffer.baseY;
+    }
+
+    dequeueOutputChunk(targetSize) {
+        if (targetSize <= 0 || this.pendingTerminalOutputBytes <= 0) {
+            return '';
+        }
+
+        let remaining = targetSize;
+        const parts = [];
+
+        while (remaining > 0 && this.pendingTerminalOutputChunks.length > 0) {
+            const head = this.pendingTerminalOutputChunks[0];
+            if (head.length <= remaining) {
+                parts.push(head);
+                this.pendingTerminalOutputChunks.shift();
+                this.pendingTerminalOutputBytes -= head.length;
+                remaining -= head.length;
+                continue;
+            }
+
+            parts.push(head.slice(0, remaining));
+            this.pendingTerminalOutputChunks[0] = head.slice(remaining);
+            this.pendingTerminalOutputBytes -= remaining;
+            remaining = 0;
+        }
+
+        return parts.join('');
+    }
+
+    dequeuePreparedChunk(targetSize) {
+        if (targetSize <= 0 || this.preparedTerminalOutputBytes <= 0) {
+            return '';
+        }
+
+        let remaining = targetSize;
+        const parts = [];
+
+        while (remaining > 0 && this.preparedTerminalOutputChunks.length > 0) {
+            const head = this.preparedTerminalOutputChunks[0];
+            if (head.length <= remaining) {
+                parts.push(head);
+                this.preparedTerminalOutputChunks.shift();
+                this.preparedTerminalOutputBytes -= head.length;
+                remaining -= head.length;
+                continue;
+            }
+
+            parts.push(head.slice(0, remaining));
+            this.preparedTerminalOutputChunks[0] = head.slice(remaining);
+            this.preparedTerminalOutputBytes -= remaining;
+            remaining = 0;
+        }
+
+        return parts.join('');
+    }
+
+    dequeueRenderableChunk(targetSize) {
+        const fromPrepared = this.dequeuePreparedChunk(targetSize);
+        if (fromPrepared) {
+            return fromPrepared;
+        }
+        return this.dequeueOutputChunk(targetSize);
+    }
+
+    adaptOutputRenderChunk(frameCostMs) {
+        // Backlog-aware render sizing: prioritize UI responsiveness first.
+        const backlogBytes = this.pendingTerminalOutputBytes;
+
+        if (frameCostMs > this.outputRenderTargetFrameMs) {
+            this.outputRenderChunkSize = Math.max(
+                this.outputRenderChunkMin,
+                Math.floor(this.outputRenderChunkSize * 0.8)
+            );
+            return;
+        }
+
+        if (backlogBytes > 512 * 1024 || frameCostMs < this.outputRenderTargetFrameMs * 0.5) {
+            this.outputRenderChunkSize = Math.min(
+                this.outputRenderChunkMax,
+                Math.floor(this.outputRenderChunkSize * 1.12)
+            );
         }
     }
 
@@ -1304,7 +1588,7 @@ class WebTerminal {
                 return;
             }
             this.send({ type: 'ping', t: performance.now() });
-        }, 5000);
+        }, 2000);
     }
 
     stopRttPing() {
@@ -1321,9 +1605,32 @@ class WebTerminal {
         }
         const sample = Math.max(1, performance.now() - sentAt);
         this.rttMs = this.rttMs * 0.8 + sample * 0.2;
+        this.updateHighLatencyMode();
+    }
+
+    updateHighLatencyMode() {
+        const shouldEnable = this.rttMs >= this.highLatencyEnterMs;
+        const shouldDisable = this.rttMs <= this.highLatencyExitMs;
+
+        if (!this.highLatencyMode && shouldEnable) {
+            this.highLatencyMode = true;
+            this.send({ type: 'latency_mode', high: true });
+            return;
+        }
+
+        if (this.highLatencyMode && shouldDisable) {
+            this.highLatencyMode = false;
+            this.send({ type: 'latency_mode', high: false });
+        }
     }
 
     updateInputFlushInterval() {
+        if (this.highLatencyMode) {
+            // Under high RTT, avoid extra local waiting so keystrokes leave immediately.
+            this.inputFlushIntervalMs = this.inputFlushMinMs;
+            return;
+        }
+
         const base = Math.round(this.rttMs / 4);
         let interval = Math.max(this.inputFlushMinMs, Math.min(this.inputFlushMaxMs, base));
 
@@ -1343,6 +1650,7 @@ class WebTerminal {
 
         // Shift+wheel accelerates long-text browsing without affecting normal scroll.
         terminalElement.addEventListener('wheel', (e) => {
+            this.markUserScrolling();
             if (!e.shiftKey) {
                 return;
             }
@@ -1356,20 +1664,50 @@ class WebTerminal {
         terminalElement.addEventListener('keydown', (e) => {
             if (!e.altKey || (e.key !== 'PageUp' && e.key !== 'PageDown')) {
                 if (e.altKey && e.key === 'Home') {
+                    this.markUserScrolling();
                     e.preventDefault();
                     this.terminal.scrollToTop();
                 } else if (e.altKey && e.key === 'End') {
+                    this.markUserScrolling();
                     e.preventDefault();
                     this.terminal.scrollToBottom();
                 }
                 return;
             }
 
+            this.markUserScrolling();
             e.preventDefault();
             const page = this.terminal.rows || 24;
             const direction = e.key === 'PageDown' ? 1 : -1;
             this.terminal.scrollLines(direction * page * 3);
         });
+    }
+
+    observeTerminalScroll() {
+        const viewport = this.terminal?.element?.querySelector('.xterm-viewport');
+        if (!viewport) {
+            return;
+        }
+
+        viewport.addEventListener('scroll', () => {
+            this.markUserScrolling();
+        }, { passive: true });
+    }
+
+    markUserScrolling() {
+        this.isUserScrolling = true;
+
+        if (this.scrollSettleTimer) {
+            clearTimeout(this.scrollSettleTimer);
+        }
+
+        this.scrollSettleTimer = setTimeout(() => {
+            this.isUserScrolling = false;
+            if (!this.outputRenderScheduled && (this.pendingTerminalOutputBytes > 0 || this.preparedTerminalOutputBytes > 0)) {
+                this.outputRenderScheduled = true;
+                requestAnimationFrame(() => this.flushTerminalOutputFrame());
+            }
+        }, this.scrollSettleDelayMs);
     }
 
     updateStats(stats) {
@@ -1492,8 +1830,18 @@ class WebTerminal {
         this.updateInputFlushInterval();
         this.inputBuffer += data;
 
+        // Keep modal editor interactions snappy (Esc/ctrl keys/arrow key CSI).
+        const hasControlSignal = /[\x00-\x1f\x7f]/.test(data);
+        const isShortEscapeSeq = data.startsWith('\x1b') && data.length <= 8;
+
         // Flush immediately for command submit and larger paste bursts.
-        if (data.includes('\r') || data.includes('\n') || this.inputBuffer.length >= this.inputImmediateThreshold) {
+        if (
+            data.includes('\r') ||
+            data.includes('\n') ||
+            hasControlSignal ||
+            isShortEscapeSeq ||
+            this.inputBuffer.length >= this.inputImmediateThreshold
+        ) {
             this.flushInputBuffer();
             return;
         }
@@ -1547,6 +1895,60 @@ class WebTerminal {
         if (this.statusElement) {
             this.statusElement.textContent = text;
             this.statusElement.className = state;
+        }
+    }
+
+    warmupContext() {
+        if (this.contextWarmupDone) {
+            return;
+        }
+
+        this.contextWarmupDone = true;
+        // Prime cwd and file context in background for instant explorer open.
+        this.send({ type: 'get_cwd' });
+    }
+
+    getDirectoryCacheKey(path) {
+        return path || '__root__';
+    }
+
+    getCachedDirectory(path) {
+        const key = this.getDirectoryCacheKey(path);
+        const cached = this.directoryCache.get(key);
+        if (!cached) {
+            return null;
+        }
+
+        if (Date.now() - cached.ts > this.directoryCacheTtlMs) {
+            this.directoryCache.delete(key);
+            return null;
+        }
+
+        return cached.data;
+    }
+
+    setCachedDirectory(path, data) {
+        const key = this.getDirectoryCacheKey(path || data?.path);
+        if (!key) {
+            return;
+        }
+        const cloned = typeof structuredClone === 'function'
+            ? structuredClone(data)
+            : JSON.parse(JSON.stringify(data));
+        this.directoryCache.set(key, { ts: Date.now(), data: cloned });
+    }
+
+    async prefetchDirectory(path) {
+        try {
+            const url = path ? `/api/files?path=${encodeURIComponent(path)}` : '/api/files';
+            const response = await fetch(url);
+            if (!response.ok) {
+                return;
+            }
+            const data = await response.json();
+            this.setCachedDirectory(path, data);
+        } catch (_) {
+            // Silent preload failure: user-facing load path will still fetch on demand.
         }
     }
 
@@ -1610,7 +2012,14 @@ class WebTerminal {
         this.fileExplorer.classList.remove('hidden');
         this.explorerToggle.classList.add('active');
         this.explorerVisible = true;
-        // Request current working directory from terminal
+
+        // Render cached cwd context first for instant open, then refresh.
+        const targetPath = this.preloadedCwd || (this.currentPath && this.currentPath !== '~' ? this.currentPath : null);
+        if (targetPath) {
+            this.loadDirectory(targetPath, false, { preferCache: true });
+        }
+
+        // Request latest cwd from terminal to keep explorer in sync.
         this.send({ type: 'get_cwd' });
         // Refit terminal after layout change
         setTimeout(() => this.handleResize(), 50);
@@ -1624,7 +2033,27 @@ class WebTerminal {
         setTimeout(() => this.handleResize(), 50);
     }
 
-    async loadDirectory(path, addToHistory = true) {
+    async loadDirectory(path, addToHistory = true, options = {}) {
+        const { preferCache = false, silent = false } = options;
+
+        const applyDirectoryData = (data) => {
+            // Add current path to history before changing (if not going back)
+            if (addToHistory && this.currentPath && this.currentPath !== data.path) {
+                this.pathHistory.push(this.currentPath);
+            }
+
+            this.currentPath = data.path;
+            this.updateBackButton();
+            this.renderFileList(data);
+        };
+
+        if (preferCache) {
+            const cached = this.getCachedDirectory(path);
+            if (cached) {
+                applyDirectoryData(cached);
+            }
+        }
+
         try {
             const url = path ? `/api/files?path=${encodeURIComponent(path)}` : '/api/files';
             const response = await fetch(url);
@@ -1635,18 +2064,14 @@ class WebTerminal {
 
             const data = await response.json();
 
-            // Add current path to history before changing (if not going back)
-            if (addToHistory && this.currentPath && this.currentPath !== data.path) {
-                this.pathHistory.push(this.currentPath);
-            }
-
-            this.currentPath = data.path;
-            this.updateBackButton();
-            this.renderFileList(data);
+            this.setCachedDirectory(path, data);
+            applyDirectoryData(data);
         } catch (error) {
             console.error('Failed to load directory:', error);
-            this.fileList.innerHTML = `<div class="file-item" style="color: var(--ctp-red);">Error: ${error.message}</div>`;
-            this.toast.error(`Error loading files: ${error.message}`);
+            if (!silent) {
+                this.fileList.innerHTML = `<div class="file-item" style="color: var(--ctp-red);">Error: ${error.message}</div>`;
+                this.toast.error(`Error loading files: ${error.message}`);
+            }
         }
     }
 
@@ -1781,4 +2206,6 @@ class WebTerminal {
 
 // Initialize terminal app
 const terminalApp = new WebTerminal();
-terminalApp.init();
+terminalApp.init().catch((error) => {
+    console.error('Failed to initialize terminal:', error);
+});
