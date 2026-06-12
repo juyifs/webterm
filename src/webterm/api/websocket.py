@@ -1,6 +1,7 @@
 """WebSocket connection manager for webterm."""
 
 import asyncio
+import gzip
 import json
 from typing import Optional
 
@@ -14,13 +15,20 @@ logger = get_logger("websocket")
 
 STATS_INTERVAL = 2.0  # seconds between stats updates
 STATS_INTERVAL_HIGH_LATENCY = 5.0
-OUTPUT_BATCH_WINDOW = 0.004  # seconds to coalesce PTY output burst
-OUTPUT_BATCH_MAX_BYTES = 64 * 1024
+OUTPUT_BATCH_WINDOW = 0.006  # seconds to coalesce PTY output burst
+OUTPUT_BATCH_MAX_BYTES = 96 * 1024
 OUTPUT_BATCH_WINDOW_MIN = 0.002
-OUTPUT_BATCH_WINDOW_MAX = 0.012
-PROTOCOL_VERSION = 2
+OUTPUT_BATCH_WINDOW_MAX = 0.024
+SEND_COALESCE_WINDOW = 0.003
+SEND_COALESCE_WINDOW_HIGH_LATENCY = 0.006
+PROTOCOL_VERSION = 3
 BIN_OUTPUT_FRAME = 0x01
+BIN_OUTPUT_GZIP_FRAME = 0x02
 BIN_INPUT_FRAME = 0x10
+BIN_INPUT_GZIP_FRAME = 0x11
+GZIP_OUTPUT_MIN_BYTES = 1024
+GZIP_OUTPUT_MAX_BYTES = 256 * 1024
+GZIP_SAVINGS_MIN_BYTES = 96
 
 
 class WebSocketManager:
@@ -30,6 +38,7 @@ class WebSocketManager:
         """Initialize the WebSocket manager."""
         self._detailed_stats: dict[WebSocket, bool] = {}
         self._binary_protocol: dict[WebSocket, bool] = {}
+        self._compression_protocol: dict[WebSocket, bool] = {}
         self._output_batch_window: dict[WebSocket, float] = {}
         self._output_queues: dict[WebSocket, asyncio.Queue[bytes]] = {}
         self._high_latency_mode: dict[WebSocket, bool] = {}
@@ -56,6 +65,7 @@ class WebSocketManager:
             # Initialize detailed stats state for this connection
             self._detailed_stats[websocket] = False
             self._binary_protocol[websocket] = False
+            self._compression_protocol[websocket] = False
             self._output_batch_window[websocket] = OUTPUT_BATCH_WINDOW
             self._high_latency_mode[websocket] = False
 
@@ -98,6 +108,7 @@ class WebSocketManager:
             # Clean up detailed stats state
             self._detailed_stats.pop(websocket, None)
             self._binary_protocol.pop(websocket, None)
+            self._compression_protocol.pop(websocket, None)
             self._output_batch_window.pop(websocket, None)
             self._output_queues.pop(websocket, None)
             self._high_latency_mode.pop(websocket, None)
@@ -164,6 +175,20 @@ class WebSocketManager:
 
         while True:
             payload = await output_queue.get()
+            high_latency = self._high_latency_mode.get(websocket, False)
+            coalesce_window = SEND_COALESCE_WINDOW_HIGH_LATENCY if high_latency else SEND_COALESCE_WINDOW
+            deadline = loop.time() + coalesce_window
+
+            # Wait a tiny window to capture following chunks and reduce ws send count.
+            while len(payload) < OUTPUT_BATCH_MAX_BYTES:
+                timeout = deadline - loop.time()
+                if timeout <= 0:
+                    break
+                try:
+                    extra = await asyncio.wait_for(output_queue.get(), timeout=timeout)
+                except TimeoutError:
+                    break
+                payload += extra
 
             # Coalesce queued chunks to reduce websocket frame count under load.
             while len(payload) < OUTPUT_BATCH_MAX_BYTES:
@@ -258,12 +283,15 @@ class WebSocketManager:
 
         elif msg_type == "hello":
             binary_requested = bool(message.get("binary", False))
+            compression_requested = bool(message.get("compress", False))
             self._binary_protocol[websocket] = binary_requested
+            self._compression_protocol[websocket] = binary_requested and compression_requested
             await websocket.send_json(
                 {
                     "type": "protocol",
                     "version": PROTOCOL_VERSION,
                     "binary": binary_requested,
+                    "compress": self._compression_protocol[websocket],
                 }
             )
 
@@ -294,8 +322,30 @@ class WebSocketManager:
             if frame_payload:
                 await session.pty.write(frame_payload)
             session.touch()
+        elif frame_type == BIN_INPUT_GZIP_FRAME:
+            if frame_payload:
+                try:
+                    decompressed = gzip.decompress(frame_payload)
+                except Exception:
+                    logger.warning("Invalid gzip input frame received")
+                    return
+                if decompressed:
+                    await session.pty.write(decompressed)
+            session.touch()
         else:
             logger.warning(f"Unknown binary frame type: {frame_type}")
+
+    def _maybe_compress_output(self, data: bytes) -> Optional[bytes]:
+        """Compress output payload if it yields meaningful savings."""
+        size = len(data)
+        if size < GZIP_OUTPUT_MIN_BYTES or size > GZIP_OUTPUT_MAX_BYTES:
+            return None
+
+        compressed = gzip.compress(data, compresslevel=1)
+        if len(compressed) + GZIP_SAVINGS_MIN_BYTES >= size:
+            return None
+
+        return compressed
 
     async def _send_output(self, websocket: WebSocket, data: bytes) -> None:
         """Send terminal output to WebSocket.
@@ -306,7 +356,14 @@ class WebSocketManager:
         """
         try:
             if self._binary_protocol.get(websocket, False):
-                await websocket.send_bytes(bytes([BIN_OUTPUT_FRAME]) + data)
+                compressed = None
+                if self._compression_protocol.get(websocket, False):
+                    compressed = self._maybe_compress_output(data)
+
+                if compressed is not None:
+                    await websocket.send_bytes(bytes([BIN_OUTPUT_GZIP_FRAME]) + compressed)
+                else:
+                    await websocket.send_bytes(bytes([BIN_OUTPUT_FRAME]) + data)
             else:
                 await websocket.send_json({"type": "output", "data": data.decode("utf-8", errors="replace")})
         except Exception:

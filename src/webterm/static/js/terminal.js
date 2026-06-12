@@ -569,13 +569,21 @@ class WebTerminal {
         this.perfMetricsTimer = null;
 
         // Binary protocol reduces JSON overhead for high-frequency terminal I/O.
-        this.protocolVersion = 2;
+        this.protocolVersion = 3;
         this.binaryProtocolEnabled = false;
         this.binaryProtocolReady = false;
+        this.outputCompressionSupported = typeof DecompressionStream !== 'undefined';
+        this.inputCompressionSupported = typeof CompressionStream !== 'undefined';
+        this.compressionRequested = this.outputCompressionSupported;
+        this.compressionEnabled = false;
         this.binOutputFrame = 0x01;
+        this.binOutputGzipFrame = 0x02;
         this.binInputFrame = 0x10;
+        this.binInputGzipFrame = 0x11;
+        this.inputCompressMinBytes = 1024;
         this.textEncoder = new TextEncoder();
         this.textDecoder = new TextDecoder();
+        this.binaryFrameChain = Promise.resolve();
 
         // Render output in frame-sized chunks for smoother UI during heavy streaming.
         this.pendingTerminalOutputChunks = [];
@@ -877,8 +885,9 @@ class WebTerminal {
         const bufferedBytes = this.socket ? this.socket.bufferedAmount : 0;
         const queueBytes = this.pendingTerminalOutputBytes + this.preparedTerminalOutputBytes;
         const protocol = this.binaryProtocolEnabled ? 'BIN' : 'JSON';
+        const compression = this.compressionEnabled ? 'GZ' : 'PLAIN';
         const mode = this.highLatencyMode ? 'HL' : 'NL';
-        this.perfMetrics.textContent = `RTT ${this.rttMs.toFixed(0)}ms | BUF ${Math.round(bufferedBytes / 1024)}KB | Q ${Math.round(queueBytes / 1024)}KB | CHK ${Math.round(this.outputRenderChunkSize / 1024)}KB | ${mode} | ${protocol}`;
+        this.perfMetrics.textContent = `RTT ${this.rttMs.toFixed(0)}ms | BUF ${Math.round(bufferedBytes / 1024)}KB | Q ${Math.round(queueBytes / 1024)}KB | CHK ${Math.round(this.outputRenderChunkSize / 1024)}KB | ${mode} | ${protocol}/${compression}`;
     }
 
     togglePip() {
@@ -1289,6 +1298,8 @@ class WebTerminal {
         this.socket.binaryType = 'arraybuffer';
         this.binaryProtocolEnabled = false;
         this.binaryProtocolReady = false;
+        this.compressionEnabled = false;
+        this.binaryFrameChain = Promise.resolve();
         this.textDecoder = new TextDecoder();
         this.stopRttPing();
 
@@ -1304,7 +1315,7 @@ class WebTerminal {
             this.preparedTerminalOutputBytes = 0;
 
             // Negotiate optional binary protocol (falls back to JSON automatically).
-            this.send({ type: 'hello', version: this.protocolVersion, binary: true });
+            this.send({ type: 'hello', version: this.protocolVersion, binary: true, compress: this.compressionRequested });
             this.startRttPing();
 
             this.warmupContext();
@@ -1327,6 +1338,7 @@ class WebTerminal {
                     this.enqueueTerminalOutput(message.data);
                 } else if (message.type === 'protocol') {
                     this.binaryProtocolEnabled = Boolean(message.binary);
+                    this.compressionEnabled = Boolean(message.compress) && this.compressionRequested;
                     this.binaryProtocolReady = true;
                 } else if (message.type === 'pong') {
                     this.updateRttFromPong(message.t);
@@ -1366,6 +1378,15 @@ class WebTerminal {
             return;
         }
 
+        // Ensure compressed and plain frames are processed in arrival order.
+        this.binaryFrameChain = this.binaryFrameChain
+            .then(() => this.processBinaryMessage(frame))
+            .catch((error) => {
+                console.error('Binary frame processing error:', error);
+            });
+    }
+
+    async processBinaryMessage(frame) {
         const frameType = frame[0];
         const payload = frame.slice(1);
 
@@ -1374,7 +1395,26 @@ class WebTerminal {
             if (text) {
                 this.enqueueTerminalOutput(text);
             }
+            return;
         }
+
+        if (frameType === this.binOutputGzipFrame) {
+            if (!this.compressionEnabled || !this.outputCompressionSupported) {
+                return;
+            }
+
+            const decompressed = await this.decompressGzipPayload(payload);
+            const text = this.textDecoder.decode(decompressed, { stream: true });
+            if (text) {
+                this.enqueueTerminalOutput(text);
+            }
+        }
+    }
+
+    async decompressGzipPayload(payload) {
+        const stream = new Blob([payload]).stream().pipeThrough(new DecompressionStream('gzip'));
+        const buffer = await new Response(stream).arrayBuffer();
+        return new Uint8Array(buffer);
     }
 
     enqueueTerminalOutput(rawChunk) {
@@ -1880,6 +1920,12 @@ class WebTerminal {
 
         try {
             const payload = this.textEncoder.encode(data);
+
+            if (this.compressionEnabled && this.inputCompressionSupported && payload.length >= this.inputCompressMinBytes) {
+                void this.sendCompressedBinaryInput(payload);
+                return true;
+            }
+
             const frame = new Uint8Array(payload.length + 1);
             frame[0] = this.binInputFrame;
             frame.set(payload, 1);
@@ -1888,6 +1934,40 @@ class WebTerminal {
         } catch (e) {
             console.error('Failed to send binary input, falling back to JSON:', e);
             return false;
+        }
+    }
+
+    async sendCompressedBinaryInput(payload) {
+        try {
+            const stream = new Blob([payload]).stream().pipeThrough(new CompressionStream('gzip'));
+            const compressedBuffer = await new Response(stream).arrayBuffer();
+
+            if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+                return;
+            }
+
+            const compressed = new Uint8Array(compressedBuffer);
+            if (compressed.length + 64 >= payload.length) {
+                const rawFrame = new Uint8Array(payload.length + 1);
+                rawFrame[0] = this.binInputFrame;
+                rawFrame.set(payload, 1);
+                this.socket.send(rawFrame);
+                return;
+            }
+
+            const frame = new Uint8Array(compressed.length + 1);
+            frame[0] = this.binInputGzipFrame;
+            frame.set(compressed, 1);
+            this.socket.send(frame);
+        } catch (error) {
+            // Compression is opportunistic; fallback to raw binary frame on any failure.
+            if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+                return;
+            }
+            const rawFrame = new Uint8Array(payload.length + 1);
+            rawFrame[0] = this.binInputFrame;
+            rawFrame.set(payload, 1);
+            this.socket.send(rawFrame);
         }
     }
 

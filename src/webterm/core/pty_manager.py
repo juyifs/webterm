@@ -54,6 +54,13 @@ class PTYManager:
                 # Set TERM for proper color and feature support
                 os.environ["TERM"] = "xterm-256color"
                 os.environ["COLORTERM"] = "truecolor"
+                # In web terminal sessions, inherited SSH X11 forwarding DISPLAY values
+                # (e.g. localhost:10.0) often make editors select xclip/xsel providers
+                # that are not actually reachable from this runtime.
+                display = os.environ.get("DISPLAY", "")
+                if display.startswith("localhost:") or display.startswith("127.0.0.1:"):
+                    os.environ.pop("DISPLAY", None)
+                os.environ.setdefault("TERM_PROGRAM", "webterm")
                 os.execvp(self.shell, [self.shell])
             else:
                 # Parent process
