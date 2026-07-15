@@ -7,7 +7,7 @@ import pty
 import signal
 import struct
 import termios
-from typing import Callable, Optional
+from typing import Optional
 
 from webterm.logger import get_logger
 
@@ -292,19 +292,3 @@ class PTYManager:
         except ChildProcessError:
             return True
         return False
-
-    async def start_reading(self, callback: Callable[[bytes], None]) -> None:
-        """Start continuous reading from PTY and call callback with data.
-
-        Args:
-            callback: Function to call with read data
-        """
-        while self._running and self.fd is not None:
-            try:
-                data = await self.read()
-                if data:
-                    callback(data)
-                else:
-                    await asyncio.sleep(0.01)
-            except Exception:
-                break

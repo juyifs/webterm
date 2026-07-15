@@ -583,6 +583,7 @@ class WebTerminal {
         this.inputCompressMinBytes = 1024;
         this.textEncoder = new TextEncoder();
         this.textDecoder = new TextDecoder();
+        this.textDecoderGzip = new TextDecoder();
         this.binaryFrameChain = Promise.resolve();
 
         // Render output in frame-sized chunks for smoother UI during heavy streaming.
@@ -616,7 +617,7 @@ class WebTerminal {
         // Initialize terminal with saved settings
         this.terminal = new Terminal({
             theme: this.getEffectiveTheme(this.currentTheme),
-            fontFamily: "'JetBrainsMono Nerd Font Mono', 'Menlo', 'Monaco', 'Consolas', monospace",
+            fontFamily: "'JetBrainsMono Nerd Font Mono', 'Menlo', 'Monaco', 'Consolas', 'Microsoft YaHei', 'PingFang SC', 'Noto Sans Mono CJK SC', monospace",
             fontSize: this.settings.fontSize,
             lineHeight: 1,
             letterSpacing: 0,
@@ -657,6 +658,13 @@ class WebTerminal {
                 console.warn('WebGL renderer unavailable, using default renderer:', error);
                 this.webglAddon = null;
             }
+        }
+
+        // Load Unicode 11 addon for correct wide-character (CJK) width calculation
+        if (typeof Unicode11Addon !== 'undefined' && Unicode11Addon.Unicode11Addon) {
+            this.unicode11Addon = new Unicode11Addon.Unicode11Addon();
+            this.terminal.loadAddon(this.unicode11Addon);
+            this.terminal.unicode.activeVersion = '11';
         }
 
         // Load clipboard addon if available
@@ -1301,6 +1309,7 @@ class WebTerminal {
         this.compressionEnabled = false;
         this.binaryFrameChain = Promise.resolve();
         this.textDecoder = new TextDecoder();
+        this.textDecoderGzip = new TextDecoder();
         this.stopRttPing();
 
         this.socket.onopen = () => {
@@ -1404,7 +1413,7 @@ class WebTerminal {
             }
 
             const decompressed = await this.decompressGzipPayload(payload);
-            const text = this.textDecoder.decode(decompressed, { stream: true });
+            const text = this.textDecoderGzip.decode(decompressed, { stream: true });
             if (text) {
                 this.enqueueTerminalOutput(text);
             }

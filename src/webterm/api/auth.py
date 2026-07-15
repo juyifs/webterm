@@ -1,9 +1,8 @@
 """Authentication for webterm."""
 
 import secrets
-from typing import Optional
 
-from fastapi import Cookie, HTTPException, Query, Request, status
+from fastapi import Request
 
 from webterm.core.config import settings
 
@@ -55,56 +54,6 @@ async def check_auth(request: Request) -> bool:
             return True
 
     return False
-
-
-async def require_auth(request: Request) -> None:
-    """Dependency that requires authentication.
-
-    Args:
-        request: The incoming request
-
-    Raises:
-        HTTPException: If not authenticated
-    """
-    if not await check_auth(request):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-
-def check_ws_auth(
-    token: Optional[str] = Query(None),
-    cookie_token: Optional[str] = Cookie(None, alias=AUTH_COOKIE_NAME),
-) -> bool:
-    """Check WebSocket authentication via query param or cookie.
-
-    Args:
-        token: Token from query parameter
-        cookie_token: Token from cookie
-
-    Returns:
-        True if authenticated
-
-    Raises:
-        HTTPException: If not authenticated
-    """
-    if not is_auth_enabled():
-        return True
-
-    # Check query parameter
-    if token and verify_token(token):
-        return True
-
-    # Check cookie
-    if cookie_token and verify_token(cookie_token):
-        return True
-
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Authentication required",
-    )
 
 
 def get_login_page() -> str:

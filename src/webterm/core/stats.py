@@ -1,6 +1,8 @@
 """System resource monitoring for webterm."""
 
+import json
 import os
+import platform
 import subprocess
 
 
@@ -12,8 +14,6 @@ def get_cpu_percent() -> float:
     """
     try:
         # Try macOS approach first
-        import subprocess
-
         result = subprocess.run(
             ["ps", "-A", "-o", "%cpu"],
             capture_output=True,
@@ -54,8 +54,6 @@ def get_memory_percent() -> float:
     """
     try:
         # Try macOS approach
-        import subprocess
-
         result = subprocess.run(
             ["vm_stat"],
             capture_output=True,
@@ -120,8 +118,6 @@ def get_gpu_info() -> dict | None:
     """
     # Try NVIDIA GPU (nvidia-smi)
     try:
-        import subprocess
-
         result = subprocess.run(
             [
                 "nvidia-smi",
@@ -144,8 +140,6 @@ def get_gpu_info() -> dict | None:
 
     # Try AMD GPU on Linux (via rocm-smi)
     try:
-        import subprocess
-
         result = subprocess.run(
             ["rocm-smi", "--showuse", "--json"],
             capture_output=True,
@@ -153,8 +147,6 @@ def get_gpu_info() -> dict | None:
             timeout=2,
         )
         if result.returncode == 0:
-            import json
-
             data = json.loads(result.stdout)
             for card_id, card_data in data.items():
                 if "GPU use (%)" in card_data:
@@ -165,9 +157,6 @@ def get_gpu_info() -> dict | None:
 
     # Try Apple Silicon GPU (check if available)
     try:
-        import platform
-        import subprocess
-
         if platform.system() == "Darwin" and platform.processor() == "arm":
             # Check for Apple Silicon
             result = subprocess.run(
@@ -177,8 +166,6 @@ def get_gpu_info() -> dict | None:
                 timeout=2,
             )
             if result.returncode == 0:
-                import json
-
                 data = json.loads(result.stdout)
                 displays = data.get("SPDisplaysDataType", [])
                 for display in displays:
