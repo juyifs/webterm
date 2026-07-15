@@ -3,6 +3,7 @@
 import asyncio
 import gzip
 import json
+import socket
 from typing import Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -29,6 +30,7 @@ BIN_INPUT_GZIP_FRAME = 0x11
 GZIP_OUTPUT_MIN_BYTES = 1024
 GZIP_OUTPUT_MAX_BYTES = 256 * 1024
 GZIP_SAVINGS_MIN_BYTES = 96
+GZIP_EXECUTOR_MIN_BYTES = 32 * 1024
 
 
 class WebSocketManager:
@@ -43,6 +45,60 @@ class WebSocketManager:
         self._output_queues: dict[WebSocket, asyncio.Queue[bytes]] = {}
         self._high_latency_mode: dict[WebSocket, bool] = {}
 
+    @staticmethod
+    def _unwrap_transport(send_callable, depth: int = 0):
+        """Walk through nested ASGI middleware closures to find the transport.
+
+        Starlette/FastAPI wrap the ASGI ``send`` callable through several
+        layers of exception-handling closures. Each layer simply forwards to
+        an inner ``send`` captured as a free variable, so we recursively
+        inspect closure cells until we find a bound method exposing a
+        ``.transport`` (the underlying asyncio transport set by uvicorn's
+        websocket protocol implementation).
+        """
+        if send_callable is None or depth > 10:
+            return None
+
+        bound_self = getattr(send_callable, "__self__", None)
+        transport = getattr(bound_self, "transport", None)
+        if transport is not None:
+            return transport
+
+        closure = getattr(send_callable, "__closure__", None)
+        code = getattr(send_callable, "__code__", None)
+        if not closure or not code:
+            return None
+
+        for cell in closure:
+            try:
+                value = cell.cell_contents
+            except ValueError:
+                continue
+            if callable(value):
+                found = WebSocketManager._unwrap_transport(value, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    @classmethod
+    def _disable_nagle(cls, websocket: WebSocket) -> None:
+        """Disable Nagle's algorithm (TCP_NODELAY) on the underlying socket.
+
+        Neither uvicorn nor the websockets/wsproto ASGI server implementations
+        disable Nagle's algorithm by default. Left enabled, small interactive
+        frames (single keystroke echoes) can incur delayed-ACK related stalls
+        of tens of milliseconds, unlike SSH which always disables it. This is
+        best-effort and relies on server-implementation internals, so any
+        failure is silently ignored (falls back to default socket behavior).
+        """
+        try:
+            transport = cls._unwrap_transport(websocket._send)
+            sock = transport.get_extra_info("socket") if transport is not None else None
+            if sock is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+
     async def handle_connection(self, websocket: WebSocket) -> None:
         """Handle a WebSocket connection.
 
@@ -50,6 +106,7 @@ class WebSocketManager:
             websocket: The WebSocket connection
         """
         await websocket.accept()
+        self._disable_nagle(websocket)
         session: Optional[Session] = None
 
         try:
@@ -175,20 +232,6 @@ class WebSocketManager:
 
         while True:
             payload = await output_queue.get()
-            high_latency = self._high_latency_mode.get(websocket, False)
-            coalesce_window = SEND_COALESCE_WINDOW_HIGH_LATENCY if high_latency else SEND_COALESCE_WINDOW
-            deadline = loop.time() + coalesce_window
-
-            # Wait a tiny window to capture following chunks and reduce ws send count.
-            while len(payload) < OUTPUT_BATCH_MAX_BYTES:
-                timeout = deadline - loop.time()
-                if timeout <= 0:
-                    break
-                try:
-                    extra = await asyncio.wait_for(output_queue.get(), timeout=timeout)
-                except TimeoutError:
-                    break
-                payload += extra
 
             # Coalesce queued chunks to reduce websocket frame count under load.
             while len(payload) < OUTPUT_BATCH_MAX_BYTES:
@@ -197,6 +240,32 @@ class WebSocketManager:
                 except asyncio.QueueEmpty:
                     break
                 payload += extra
+
+            # Only wait for more data if a burst was already in flight (queue had
+            # backlog above). For an isolated chunk (e.g. a single keystroke echo)
+            # sending immediately avoids adding artificial latency.
+            if not output_queue.empty():
+                high_latency = self._high_latency_mode.get(websocket, False)
+                coalesce_window = SEND_COALESCE_WINDOW_HIGH_LATENCY if high_latency else SEND_COALESCE_WINDOW
+                deadline = loop.time() + coalesce_window
+
+                while len(payload) < OUTPUT_BATCH_MAX_BYTES:
+                    timeout = deadline - loop.time()
+                    if timeout <= 0:
+                        break
+                    try:
+                        extra = await asyncio.wait_for(output_queue.get(), timeout=timeout)
+                    except TimeoutError:
+                        break
+                    payload += extra
+
+                # Drain anything else that arrived nowait during the wait above.
+                while len(payload) < OUTPUT_BATCH_MAX_BYTES:
+                    try:
+                        extra = output_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    payload += extra
 
             started = loop.time()
             await self._send_output(websocket, payload)
@@ -335,13 +404,23 @@ class WebSocketManager:
         else:
             logger.warning(f"Unknown binary frame type: {frame_type}")
 
-    def _maybe_compress_output(self, data: bytes) -> Optional[bytes]:
-        """Compress output payload if it yields meaningful savings."""
+    async def _maybe_compress_output(self, data: bytes) -> Optional[bytes]:
+        """Compress output payload if it yields meaningful savings.
+
+        Large payloads are compressed in a thread executor to avoid blocking
+        the single-threaded event loop (and thus other sessions' latency)
+        during heavy output bursts.
+        """
         size = len(data)
         if size < GZIP_OUTPUT_MIN_BYTES or size > GZIP_OUTPUT_MAX_BYTES:
             return None
 
-        compressed = gzip.compress(data, compresslevel=1)
+        if size >= GZIP_EXECUTOR_MIN_BYTES:
+            loop = asyncio.get_running_loop()
+            compressed = await loop.run_in_executor(None, gzip.compress, data, 1)
+        else:
+            compressed = gzip.compress(data, compresslevel=1)
+
         if len(compressed) + GZIP_SAVINGS_MIN_BYTES >= size:
             return None
 
@@ -358,7 +437,7 @@ class WebSocketManager:
             if self._binary_protocol.get(websocket, False):
                 compressed = None
                 if self._compression_protocol.get(websocket, False):
-                    compressed = self._maybe_compress_output(data)
+                    compressed = await self._maybe_compress_output(data)
 
                 if compressed is not None:
                     await websocket.send_bytes(bytes([BIN_OUTPUT_GZIP_FRAME]) + compressed)

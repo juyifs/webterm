@@ -1432,6 +1432,19 @@ class WebTerminal {
             return;
         }
 
+        // Under light load (no backlog, no render already scheduled), write
+        // directly instead of waiting for the next animation frame. This keeps
+        // single-keystroke echo feedback effectively immediate.
+        if (
+            !this.outputRenderScheduled &&
+            this.pendingTerminalOutputBytes === 0 &&
+            this.preparedTerminalOutputBytes === 0 &&
+            !this.shouldDeferLiveRender()
+        ) {
+            this.terminal.write(sanitized);
+            return;
+        }
+
         this.pendingTerminalOutputChunks.push(sanitized);
         this.pendingTerminalOutputBytes += sanitized.length;
         this.scheduleOutputPrepare();
@@ -1883,8 +1896,10 @@ class WebTerminal {
         const hasControlSignal = /[\x00-\x1f\x7f]/.test(data);
         const isShortEscapeSeq = data.startsWith('\x1b') && data.length <= 8;
 
-        // Flush immediately for command submit and larger paste bursts.
+        // Flush immediately for command submit, larger paste bursts, and single
+        // keystrokes (typing feedback should never wait on the micro-batch timer).
         if (
+            data.length === 1 ||
             data.includes('\r') ||
             data.includes('\n') ||
             hasControlSignal ||

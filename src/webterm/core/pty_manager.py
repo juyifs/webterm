@@ -28,6 +28,8 @@ class PTYManager:
         self.fd: Optional[int] = None
         self._running = False
         self._read_task: Optional[asyncio.Task] = None
+        self._read_ready: Optional[asyncio.Event] = None
+        self._reader_registered = False
 
     @property
     def is_running(self) -> bool:
@@ -81,6 +83,11 @@ class PTYManager:
     async def read(self, size: int = 4096) -> Optional[bytes]:
         """Read data from the PTY.
 
+        Blocks (without polling) until the PTY fd becomes readable, using an
+        event-driven reader registered on the running event loop instead of
+        busy-polling. This minimizes latency between PTY output becoming
+        available and it being observed by the caller.
+
         Args:
             size: Maximum bytes to read
 
@@ -92,10 +99,45 @@ class PTYManager:
 
         try:
             return os.read(self.fd, size)
+        except BlockingIOError:
+            pass
+        except OSError:
+            return None
+        except Exception:
+            return None
+
+        # No data was immediately available; wait for the fd to become
+        # readable rather than sleeping/polling.
+        try:
+            loop = asyncio.get_running_loop()
+            if self._read_ready is None:
+                self._read_ready = asyncio.Event()
+            if not self._reader_registered and self.fd is not None:
+                loop.add_reader(self.fd, self._on_readable)
+                self._reader_registered = True
+
+            self._read_ready.clear()
+            try:
+                await asyncio.wait_for(self._read_ready.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+        except Exception:
+            return None
+
+        if not self._running or self.fd is None:
+            return None
+
+        try:
+            return os.read(self.fd, size)
         except (OSError, BlockingIOError):
             return None
         except Exception:
             return None
+
+    def _on_readable(self) -> None:
+        """Callback invoked by the event loop when the PTY fd becomes readable."""
+        if self._read_ready is not None:
+            self._read_ready.set()
 
     def read_nowait(self, size: int = 4096) -> Optional[bytes]:
         """Try to read from PTY fd without waiting.
@@ -240,6 +282,13 @@ class PTYManager:
             return True
 
         self._running = False
+
+        if self._reader_registered and self.fd is not None:
+            try:
+                asyncio.get_running_loop().remove_reader(self.fd)
+            except Exception:
+                pass
+            self._reader_registered = False
 
         try:
             # Try SIGHUP first
