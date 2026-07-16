@@ -1015,6 +1015,10 @@ class WebTerminal {
 
             // Ctrl+Shift+V: Paste
             if (event.ctrlKey && event.shiftKey && event.key === 'V') {
+                // Prevent the browser's native paste action from also firing
+                // on xterm's hidden textarea (which would paste a second time).
+                event.preventDefault();
+                event.stopPropagation();
                 if (event.type === 'keydown') {
                     navigator.clipboard.readText().then(text => {
                         this.queueInput(text);
