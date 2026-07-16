@@ -21,6 +21,7 @@ class Session:
     pty: PTYManager
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
+    pending_redraw: bool = False
 
     def touch(self) -> None:
         """Update last activity timestamp."""

@@ -99,25 +99,44 @@ class WebSocketManager:
         except Exception:
             pass
 
-    async def handle_connection(self, websocket: WebSocket) -> None:
+    async def handle_connection(self, websocket: WebSocket, requested_session_id: Optional[str] = None) -> None:
         """Handle a WebSocket connection.
 
         Args:
             websocket: The WebSocket connection
+            requested_session_id: Optional existing session ID to resume
         """
         await websocket.accept()
         self._disable_nagle(websocket)
         session: Optional[Session] = None
+        resumed = False
 
         try:
-            # Create a new session
-            session = await session_manager.create_session()
+            # Attempt to resume an existing session first.
+            if requested_session_id:
+                session = await session_manager.get_session(requested_session_id)
+                resumed = session is not None
+                if resumed:
+                    # The client's local screen is blank after a reconnect, but
+                    # resize() is a no-op if dimensions haven't changed, so no
+                    # SIGWINCH would otherwise be sent. Force a repaint on the
+                    # next resize message the client sends after connecting.
+                    session.pending_redraw = True
+
+            # Fall back to creating a new session.
+            if not session:
+                session = await session_manager.create_session()
+
             if not session:
                 await self._send_error(websocket, "Failed to create session (limit reached)")
                 await websocket.close()
                 return
 
-            logger.info(f"WebSocket connected, session {session.id}")
+            logger.info(
+                f"WebSocket connected, session {session.id} ({'resumed' if resumed else 'new'})"
+            )
+
+            await websocket.send_json({"type": "session", "id": session.id, "resumed": resumed})
 
             # Initialize detailed stats state for this connection
             self._detailed_stats[websocket] = False
@@ -170,7 +189,11 @@ class WebSocketManager:
             self._output_queues.pop(websocket, None)
             self._high_latency_mode.pop(websocket, None)
             if session:
-                await session_manager.remove_session(session.id)
+                # Keep session alive across transient disconnects so users can
+                # resume long-running interactive apps (e.g. nvim/tmux).
+                # Expired or dead sessions are cleaned up by existing managers.
+                if not session.pty.is_running:
+                    await session_manager.remove_session(session.id)
 
     async def _read_pty_loop(self, websocket: WebSocket, session: Session, output_queue: asyncio.Queue[bytes]) -> None:
         """Read from PTY and send to WebSocket.
@@ -205,7 +228,17 @@ class WebSocketManager:
                 logger.error(f"PTY read error: {e}")
                 break
 
+        # The PTY died (process exited, or the session was reaped by the idle
+        # timeout cleanup task) while the websocket was still open. Without an
+        # explicit close here the client's socket stays "open" forever with no
+        # way to detect that input/output is going nowhere, appearing frozen
+        # until the page is manually reloaded. Close the websocket so the
+        # client's onclose handler fires and triggers its own reconnect logic.
         await self._send_error(websocket, "Session terminated")
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
     async def _enqueue_output(self, output_queue: asyncio.Queue[bytes], payload: bytes) -> None:
         """Queue PTY output for websocket sending.
@@ -332,6 +365,9 @@ class WebSocketManager:
             rows = message.get("rows", 24)
             cols = message.get("cols", 80)
             session.pty.resize(rows, cols)
+            if session.pending_redraw:
+                session.pending_redraw = False
+                session.pty.force_redraw()
             session.touch()
 
         elif msg_type == "stats_detail":

@@ -208,6 +208,29 @@ class PTYManager:
             logger.error(f"Failed to resize PTY: {e}")
             return False
 
+    def force_redraw(self) -> None:
+        """Force the current foreground process to repaint its screen.
+
+        The kernel only delivers SIGWINCH when TIOCSWINSZ actually changes the
+        winsize; if a resumed session reports the same rows/cols it already
+        has, a plain resize() call is a no-op and apps like vim/tmux never
+        redraw, leaving the client showing a stale/blank screen after a
+        reconnect. Briefly toggle the column count by one and set it back so
+        the kernel observes a real change (twice) and (re-)delivers SIGWINCH
+        to the foreground process group.
+        """
+        if not self._running or self.fd is None:
+            return
+
+        try:
+            current = fcntl.ioctl(self.fd, termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0))
+            rows, cols, xpix, ypix = struct.unpack("HHHH", current)
+            toggled_cols = cols - 1 if cols > 1 else cols + 1
+            fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, toggled_cols, xpix, ypix))
+            fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, xpix, ypix))
+        except Exception as e:
+            logger.error(f"Failed to force redraw: {e}")
+
     def get_cwd(self) -> str:
         """Get the current working directory of the PTY process.
 

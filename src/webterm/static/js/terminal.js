@@ -451,6 +451,9 @@ class WebTerminal {
         this.reconnectDelay = 1000;
         this.isConnected = false;
         this.fontReady = false;
+        this.sessionStorageKey = 'webterm-session-id';
+        this.sessionId = localStorage.getItem(this.sessionStorageKey) || null;
+        this.lastConnectWasReconnect = false;
 
         // Components
         this.toast = new ToastManager();
@@ -567,6 +570,8 @@ class WebTerminal {
         this.highLatencyEnterMs = 140;
         this.highLatencyExitMs = 110;
         this.perfMetricsTimer = null;
+        this.lastPongAt = Date.now();
+        this.pongStaleThresholdMs = 8000;
 
         // Binary protocol reduces JSON overhead for high-frequency terminal I/O.
         this.protocolVersion = 3;
@@ -714,6 +719,7 @@ class WebTerminal {
         document.addEventListener('visibilitychange', () => {
             if (!document.hidden) {
                 this.stabilizeTerminalLayout();
+                this.checkConnectionHealth();
             }
         });
         this.terminal.onResize(({ rows, cols }) => {
@@ -1301,9 +1307,30 @@ class WebTerminal {
         return output;
     }
 
+    resetTerminalForNewSession() {
+        if (!this.terminal) {
+            return;
+        }
+
+        // Reconnect creates a brand-new PTY session on the server side. Reset
+        // local parser/mode state (mouse tracking, alt screen, etc.) so stale
+        // client-side modes from the previous session do not leak into the new shell.
+        this.terminal.reset();
+        this.outputSanitizeRemainder = '';
+        this.inputBuffer = '';
+        this.pendingTerminalOutputChunks = [];
+        this.pendingTerminalOutputBytes = 0;
+        this.preparedTerminalOutputChunks = [];
+        this.preparedTerminalOutputBytes = 0;
+        this.handleResize();
+    }
+
     connect() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws/terminal`;
+        let wsUrl = `${protocol}//${window.location.host}/ws/terminal`;
+        if (this.sessionId) {
+            wsUrl += `?sid=${encodeURIComponent(this.sessionId)}`;
+        }
 
         this.setStatus('connecting', 'Connecting...');
         this.socket = new WebSocket(wsUrl);
@@ -1317,6 +1344,7 @@ class WebTerminal {
         this.stopRttPing();
 
         this.socket.onopen = () => {
+            this.lastConnectWasReconnect = this.reconnectAttempts > 0;
             this.reconnectAttempts = 0;
             this.isConnected = true;
             this.setStatus('connected', 'Connected');
@@ -1349,6 +1377,17 @@ class WebTerminal {
 
                 if (message.type === 'output') {
                     this.enqueueTerminalOutput(message.data);
+                } else if (message.type === 'session') {
+                    if (typeof message.id === 'string' && message.id.length > 0) {
+                        const sessionChanged = this.sessionId !== null && this.sessionId !== message.id;
+                        this.sessionId = message.id;
+                        localStorage.setItem(this.sessionStorageKey, message.id);
+                        // On reconnect, reset only when server moved us to a new
+                        // PTY session (e.g. previous one expired).
+                        if (this.lastConnectWasReconnect && (message.resumed === false || sessionChanged)) {
+                            this.resetTerminalForNewSession();
+                        }
+                    }
                 } else if (message.type === 'protocol') {
                     this.binaryProtocolEnabled = Boolean(message.binary);
                     this.compressionEnabled = Boolean(message.compress) && this.compressionRequested;
@@ -1649,12 +1688,38 @@ class WebTerminal {
 
     startRttPing() {
         this.stopRttPing();
+        this.lastPongAt = Date.now();
         this.rttPingTimer = setInterval(() => {
             if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
                 return;
             }
+            // If pongs stop arriving (dead/zombie connection e.g. from an idle
+            // NAT/proxy timeout that never sent a close frame), the socket can
+            // still report readyState === OPEN forever while input silently
+            // goes nowhere. Force-close so onclose fires and reconnection kicks in.
+            if (Date.now() - this.lastPongAt > this.pongStaleThresholdMs) {
+                console.warn('WebSocket appears dead (no pong received), reconnecting...');
+                this.socket.close();
+                return;
+            }
             this.send({ type: 'ping', t: performance.now() });
         }, 2000);
+    }
+
+    checkConnectionHealth() {
+        if (!this.socket) {
+            return;
+        }
+        if (this.socket.readyState !== WebSocket.OPEN) {
+            return;
+        }
+        if (Date.now() - this.lastPongAt > this.pongStaleThresholdMs) {
+            console.warn('Connection stale after being idle/hidden, reconnecting...');
+            this.socket.close();
+        } else {
+            // Nudge immediately rather than waiting for the next timer tick.
+            this.send({ type: 'ping', t: performance.now() });
+        }
     }
 
     stopRttPing() {
@@ -1666,6 +1731,7 @@ class WebTerminal {
     }
 
     updateRttFromPong(sentAt) {
+        this.lastPongAt = Date.now();
         if (typeof sentAt !== 'number') {
             return;
         }

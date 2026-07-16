@@ -28,6 +28,7 @@ async def index(request: Request):
 async def websocket_terminal(
     websocket: WebSocket,
     token: Optional[str] = Query(None),
+    sid: Optional[str] = Query(None),
     webterm_auth: Optional[str] = Cookie(None),
 ):
     """WebSocket endpoint for terminal communication.
@@ -35,6 +36,7 @@ async def websocket_terminal(
     Args:
         websocket: The WebSocket connection
         token: Optional token from query parameter
+        sid: Optional session ID for reconnect resume
         webterm_auth: Optional token from cookie
     """
     # Check authentication for WebSocket
@@ -52,4 +54,4 @@ async def websocket_terminal(
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
 
-    await ws_manager.handle_connection(websocket)
+    await ws_manager.handle_connection(websocket, requested_session_id=sid)
