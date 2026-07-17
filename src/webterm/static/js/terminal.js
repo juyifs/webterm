@@ -530,6 +530,10 @@ class WebTerminal {
         this.pipProcesses = document.getElementById('pip-processes');
         this.pipVisible = false;
 
+        // New session control
+        this.newSessionBtn = document.getElementById('new-session-btn');
+        this.pendingNewSession = false;
+
         // File explorer elements
         this.explorerToggle = document.getElementById('explorer-toggle');
         this.fileExplorer = document.getElementById('file-explorer');
@@ -739,6 +743,11 @@ class WebTerminal {
         // Make PiP draggable
         this.initPipDrag();
 
+        // New session button
+        if (this.newSessionBtn) {
+            this.newSessionBtn.addEventListener('click', () => this.requestNewSession());
+        }
+
         // File explorer setup
         this.initFileExplorer();
 
@@ -924,6 +933,21 @@ class WebTerminal {
         this.pipVisible = false;
         // Disable detailed stats to reduce server load
         this.send({ type: 'stats_detail', enabled: false });
+    }
+
+    requestNewSession() {
+        if (!this.isConnected) {
+            this.toast.error('Cannot start a new session while disconnected');
+            return;
+        }
+
+        if (this.pendingNewSession) {
+            return;
+        }
+
+        this.pendingNewSession = true;
+        this.send({ type: 'new_session' });
+        this.toast.info('Starting a new session...');
     }
 
     initPipDrag() {
@@ -1380,11 +1404,17 @@ class WebTerminal {
                 } else if (message.type === 'session') {
                     if (typeof message.id === 'string' && message.id.length > 0) {
                         const sessionChanged = this.sessionId !== null && this.sessionId !== message.id;
+                        const wasExplicitNewSession = this.pendingNewSession;
+                        this.pendingNewSession = false;
                         this.sessionId = message.id;
                         localStorage.setItem(this.sessionStorageKey, message.id);
-                        // On reconnect, reset only when server moved us to a new
-                        // PTY session (e.g. previous one expired).
-                        if (this.lastConnectWasReconnect && (message.resumed === false || sessionChanged)) {
+                        // Reset the terminal when: the user explicitly requested a new
+                        // session, or on reconnect the server moved us to a new PTY
+                        // session (e.g. previous one expired).
+                        if (
+                            wasExplicitNewSession ||
+                            (this.lastConnectWasReconnect && (message.resumed === false || sessionChanged))
+                        ) {
                             this.resetTerminalForNewSession();
                         }
                     }
@@ -1397,6 +1427,10 @@ class WebTerminal {
                 } else if (message.type === 'error') {
                     console.error('Server error:', message.message);
                     this.toast.error(message.message);
+                    // If the server failed to fulfill an explicit new-session
+                    // request, clear the pending flag so the user can retry
+                    // instead of the button being stuck disabled forever.
+                    this.pendingNewSession = false;
                 } else if (message.type === 'stats') {
                     this.updateStats(message);
                 } else if (message.type === 'cwd') {

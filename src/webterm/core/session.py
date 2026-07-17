@@ -91,6 +91,41 @@ class SessionManager:
             logger.info(f"Created session {session_id}")
             return session
 
+    async def reset_session(self, session_id: str, shell: Optional[str] = None) -> Optional[Session]:
+        """Terminate the current PTY for a session and spawn a fresh one.
+
+        The session id is preserved so the client's websocket connection and
+        stored session id remain valid; only the underlying shell process is
+        replaced.
+
+        Args:
+            session_id: Session ID to reset
+            shell: Optional shell path override
+
+        Returns:
+            The reset session, or None if the session doesn't exist or the
+            new PTY failed to spawn
+        """
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return None
+
+            await session.pty.terminate()
+
+            shell_path = shell or settings.get_shell()
+            new_pty = PTYManager(shell=shell_path)
+            if not await new_pty.spawn():
+                logger.error(f"Failed to spawn PTY while resetting session {session_id}")
+                return None
+
+            session.pty = new_pty
+            session.created_at = time.time()
+            session.last_activity = time.time()
+            session.pending_redraw = False
+            logger.info(f"Reset session {session_id} with a new PTY")
+            return session
+
     async def get_session(self, session_id: str) -> Optional[Session]:
         """Get a session by ID.
 

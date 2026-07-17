@@ -11,23 +11,6 @@
 
 <body>
     <div id="terminal-container">
-        <header id="header-bar">
-            <button id="explorer-toggle" class="header-btn" title="Toggle File Explorer">
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-                    <path
-                        d="M1 3.5A1.5 1.5 0 0 1 2.5 2h2.764a1.5 1.5 0 0 1 1.06.44l.74.74H13.5A1.5 1.5 0 0 1 15 4.5v8a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5v-9zM2.5 3a.5.5 0 0 0-.5.5V6h12V4.5a.5.5 0 0 0-.5-.5H6.64a.5.5 0 0 1-.354-.147l-.94-.94A.5.5 0 0 0 5.264 3H2.5zM14 7H2v5.5a.5.5 0 0 0 .5.5h11a.5.5 0 0 0 .5-.5V7z" />
-                </svg>
-            </button>
-            <span class="title">WebTerm</span>
-            <div class="header-spacer"></div>
-            <div id="system-stats">
-                <span id="cpu-usage" title="Click for details" class="clickable">CPU: --</span>
-                <span id="mem-usage" title="Click for details" class="clickable">MEM: --</span>
-                <span id="gpu-usage" title="GPU Usage" style="display: none;">GPU: --</span>
-            </div>
-
-
-        </header>
         <div id="main-content">
             <!-- File Explorer Sidebar -->
             <aside id="file-explorer" class="hidden">
@@ -79,7 +62,22 @@
             <div id="terminal"></div>
         </div>
         <footer id="footer-bar">
+            <button id="explorer-toggle" class="footer-btn" title="Toggle File Explorer">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M9.828 3h3.982a2 2 0 0 1 1.992 2.181l-.637 7A2 2 0 0 1 13.174 14H2.826a2 2 0 0 1-1.991-1.819l-.637-7a1.99 1.99 0 0 1 .342-1.31L.5 3a2 2 0 0 1 2-2h3.672a2 2 0 0 1 1.414.586l.828.828A2 2 0 0 0 9.828 3zm-8.322.12C1.72 3.042 1.95 3 2.19 3h5.396l-.707-.707A1 1 0 0 0 6.172 2H2.5a1 1 0 0 0-1 .981l.006.139z" />
+                </svg>
+            </button>
+            <button id="new-session-btn" class="footer-btn" title="Start New Session">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M8 2a.5.5 0 0 1 .5.5v5h5a.5.5 0 0 1 0 1h-5v5a.5.5 0 0 1-1 0v-5h-5a.5.5 0 0 1 0-1h5v-5A.5.5 0 0 1 8 2z" />
+                </svg>
+            </button>
             <span id="connection-status">Connecting...</span>
+            <span id="system-stats">
+                <span id="cpu-usage" class="clickable">CPU: --%</span>
+                <span id="mem-usage" class="clickable">MEM: --%</span>
+                <span id="gpu-usage" class="clickable" style="display: none;">GPU: --%</span>
+            </span>
             <button id="perf-indicator" class="footer-chip" title="Click to cycle performance profile">
                 PERF: --
             </button>

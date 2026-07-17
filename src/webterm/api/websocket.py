@@ -8,6 +8,8 @@ from typing import Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from webterm.core.config import settings
+from webterm.core.pty_manager import PTYManager
 from webterm.core.session import Session, session_manager
 from webterm.core.stats import get_system_stats
 from webterm.logger import get_logger
@@ -407,8 +409,36 @@ class WebSocketManager:
         elif msg_type == "latency_mode":
             self._high_latency_mode[websocket] = bool(message.get("high", False))
 
+        elif msg_type == "new_session":
+            await self._handle_new_session(websocket, session)
+
         else:
             logger.warning(f"Unknown message type: {msg_type}")
+
+    async def _handle_new_session(self, websocket: WebSocket, session: Session) -> None:
+        """Reset the session's PTY, starting a fresh shell process.
+
+        The session id is preserved (the ``Session`` object mutated in place
+        by ``reset_session`` keeps the same identity in ``session_manager``'s
+        registry), so the client's stored session id and websocket connection
+        remain valid. Only the underlying shell process is replaced.
+        """
+        try:
+            reset = await session_manager.reset_session(session.id)
+            if not reset:
+                await self._send_error(websocket, "Failed to start a new session")
+                return
+
+            # Force a repaint on the next resize so the freshly spawned shell's
+            # prompt renders correctly against the client's current dimensions.
+            session.pending_redraw = True
+            session.touch()
+
+            await websocket.send_json({"type": "session", "id": session.id, "resumed": False})
+            logger.info(f"Session {session.id} reset with a new shell process")
+        except Exception as e:
+            logger.error(f"Failed to reset session {session.id}: {e}")
+            await self._send_error(websocket, "Failed to start a new session")
 
     async def _handle_binary_message(self, websocket: WebSocket, session: Session, payload: bytes) -> None:
         """Handle binary websocket messages.
