@@ -1347,6 +1347,19 @@ class WebTerminal {
         this.preparedTerminalOutputChunks = [];
         this.preparedTerminalOutputBytes = 0;
         this.handleResize();
+
+        // The freshly spawned server-side PTY starts at its own default
+        // window size. xterm's onResize callback only fires when the local
+        // terminal's rows/cols actually change, which is normally NOT the
+        // case here since the browser viewport didn't change - so the
+        // client would otherwise never tell the server about the real
+        // terminal dimensions, leaving the new shell rendering into a small
+        // corner instead of filling the window. Explicitly resend the
+        // current dimensions to keep the new PTY in sync.
+        if (this.terminal) {
+            const { rows, cols } = this.terminal;
+            this.send({ type: 'resize', rows: rows, cols: cols });
+        }
     }
 
     connect() {
